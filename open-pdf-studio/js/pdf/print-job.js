@@ -1,0 +1,480 @@
+// Background print job: render the selected pages to a temp PDF and spool it
+// to the printer, reporting progress through printProgressStore so the print
+// dialog can close immediately and the user keeps working.
+
+import { PDFDocument } from 'pdf-lib';
+import i18next from '../i18n/config.js';
+import { getActiveDocument, getPageRotation } from '../core/state.js';
+import { invoke, isNietInBrowser, readBinaryFile, writeBinaryFile, opgeslagenPad, leesHostPad, leesHostNieuwPad, extractFileName } from '../core/platform.js';
+import { meldingTekst } from '../core/webfuncties.js';
+import { renderPageOffscreen, renderMarkeringenOffscreen, canvasToBytes } from './exporter.js';
+import { getCachedPdfBytes } from './loader.js';
+import { viewportOpties } from './getoonde-pagina.js';
+import {
+  berekenPlaatsing, renderDeel, ongedraaidDeel, printPxPerPt, voegPrintPaginaToe,
+} from './print-plaatsing.js';
+import { bouwVectorPrintPdf, maakTegelRaster, vakkenUitRaster, vakOpVel } from './print-vector.js';
+import { markeringenVoorInhoud } from '../solid/stores/print-instellingen.js';
+import { maakMeerPerBlad, isMeerPerBlad, bronKeuzes } from './print-meerperblad.js';
+import { maakPoster } from './print-poster.js';
+import { maakBoekje } from './print-boekje.js';
+import { zetCanvasOm, beeldFormaatVoor, vectorMogelijk } from './print-kleur.js';
+import { uitsnedePxPerPt, uitsnedeRenderVak } from './print-huidige-weergave.js';
+import {
+  startPrintProgress, updatePrintProgress, finishPrintProgress, failPrintProgress,
+} from '../solid/stores/printProgressStore.js';
+
+/**
+ * Een canvas een kwartslag linksom gedraaid: de bovenrand komt links. Dezelfde
+ * richting als DRAAIING_HAAKS in print-plaatsing.js en als de printkern in
+ * Rust (`draai_linksom`).
+ */
+function kwartslagLinksom(canvas) {
+  const uit = document.createElement('canvas');
+  uit.width = canvas.height;
+  uit.height = canvas.width;
+  const ctx = uit.getContext('2d');
+  ctx.translate(0, uit.height);
+  ctx.rotate(-Math.PI / 2);
+  ctx.drawImage(canvas, 0, 0);
+  return uit;
+}
+
+/** Een canvas over `graden` (0/90/180/270) rechtsom gedraaid, zoals de weergave (#200). */
+function draaiRechtsom(canvas, graden) {
+  const r = ((Math.round((Number(graden) || 0) / 90) * 90) % 360 + 360) % 360;
+  if (!r) return canvas;
+  const kwart = r === 90 || r === 270;
+  const uit = document.createElement('canvas');
+  uit.width = kwart ? canvas.height : canvas.width;
+  uit.height = kwart ? canvas.width : canvas.height;
+  const ctx = uit.getContext('2d');
+  ctx.translate(uit.width / 2, uit.height / 2);
+  ctx.rotate((r * Math.PI) / 180);
+  ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
+  return uit;
+}
+
+/** Het vak `px` uit `canvas`; het hele canvas blijft hetzelfde canvas. */
+function knip(canvas, px) {
+  if (px.x === 0 && px.y === 0 && px.breedte === canvas.width && px.hoogte === canvas.height) return canvas;
+  const uit = document.createElement('canvas');
+  uit.width = px.breedte;
+  uit.height = px.hoogte;
+  uit.getContext('2d').drawImage(canvas, px.x, px.y, px.breedte, px.hoogte, 0, 0, px.breedte, px.hoogte);
+  return uit;
+}
+
+/**
+ * Het beeld van een uitsnede van "Huidige weergave" (print-huidige-weergave.js)
+ * zoals ze op het scherm ligt: alleen dat deel van de pagina gerenderd, met
+ * de markeringen, en gedraaid over de weergaverotatie. Voor de plaatsing is
+ * dit beeld de hele pagina.
+ */
+async function renderUitsnede(pageNum, pxPerPt, uitsnede, markeringen) {
+  const canvas = await renderPageOffscreen(pageNum, pxPerPt, {
+    deel: uitsnedeRenderVak(uitsnede, pxPerPt), markeringen,
+  });
+  return draaiRechtsom(canvas, uitsnede.rotatie);
+}
+
+/**
+ * Het paginabeeld van `deel` (renderDeel) zoals het op het vel ligt: gerenderd
+ * uit de getoonde pagina en, als de pagina haaks op het vel stond
+ * (`plaatsing.gedraaid`), een kwartslag linksom gedraaid. Het voorbeeld in de
+ * printdialoog en de printopdracht gebruiken allebei deze functie. `kleur`
+ * is de kleurmodus van de afdruk (print-kleur.js): bij grijswaarden of
+ * zwart-wit worden de pixels omgezet, zodat voorbeeld en afdruk gelijk zijn.
+ * `uitsnede` (Huidige weergave, #947): de plaatsing hoort dan bij de
+ * uitsnede in plaats van bij de hele pagina.
+ * @returns {Promise<HTMLCanvasElement>}
+ */
+export async function renderPrintBeeld(pageNum, pxPerPt, plaatsing, deel, { markeringen = true, kleur = 'color', uitsnede = null } = {}) {
+  if (uitsnede) {
+    const beeld = await renderUitsnede(pageNum, pxPerPt, uitsnede, markeringen);
+    const stuk = knip(beeld, ongedraaidDeel(plaatsing, pxPerPt, deel.px));
+    return zetCanvasOm(plaatsing.gedraaid ? kwartslagLinksom(stuk) : stuk, kleur);
+  }
+  const canvas = await renderPageOffscreen(pageNum, pxPerPt, {
+    deel: ongedraaidDeel(plaatsing, pxPerPt, deel.px), markeringen,
+  });
+  return zetCanvasOm(plaatsing.gedraaid ? kwartslagLinksom(canvas) : canvas, kleur);
+}
+
+/**
+ * The temporary print PDF (not saved yet): every page as a page image. Scale
+ * and position come from print-plaatsing.js, the same rule as the preview:
+ * with a known sheet (`vel`, portrait in mm) each page becomes a page at
+ * paper size with the image at the chosen place and scale (`opVel`);
+ * without a sheet each page keeps its own size, as before the scale choice.
+ * Only the part of a page that lands on the sheet is rendered, at 300 dpi on
+ * paper and never finer than 300 dpi of the page itself. Prints nothing.
+ * `inhoud` volgt de keuzelijst "Afdrukken": 'doc-only' laat de markeringen
+ * weg, alles anders drukt document én markeringen af
+ * (stores/print-instellingen.js). `kleur` is de kleurmodus (print-kleur.js):
+ * grijswaarden of zwart-wit zet elk paginabeeld om; zwart-wit gaat als PNG
+ * het bestand in, zodat het puur zwart en wit blijft. `uitsneden` (Huidige
+ * weergave, #947): per paginanummer het zichtbare deel; zo'n pagina wordt
+ * alleen dat deel, passend op het vel zoals een hele pagina.
+ * @param {{ doc: object, pages:number[], uitsneden?: Map<number, object>|null, orientatie?:'auto'|'portrait'|'landscape',
+ *           vel?: {breedteMm:number, hoogteMm:number}|null,
+ *           schaling?: string, zoom?: number, centreren?: boolean, inhoud?: string,
+ *           kleur?: 'color'|'grayscale'|'bw',
+ *           voortgang?: (index:number, pageNum:number) => void }} opts
+ * @returns {Promise<{ pdf: PDFDocument, opVel: boolean }>}
+ */
+export async function bouwPrintPdf({
+  doc, pages, orientatie = 'auto', vel = null, schaling = 'fit', zoom = 100, centreren = true,
+  inhoud = 'doc-and-markups', kleur = 'color', voortgang = () => {}, uitsneden = null,
+}) {
+  const markeringen = markeringenVoorInhoud(inhoud);
+  const pdf = await PDFDocument.create();
+  // Pages laid out on the sheet (the sheet is the same for every page).
+  let opVel = false;
+  for (let i = 0; i < pages.length; i++) {
+    const pageNum = pages[i];
+    voortgang(i, pageNum);
+    const uitsnede = uitsneden?.get?.(pageNum) || null;
+    let pagina;
+    if (uitsnede) {
+      pagina = { breedtePt: uitsnede.breedtePt, hoogtePt: uitsnede.hoogtePt };
+    } else {
+      const origPage = await doc.pdfDoc.getPage(pageNum);
+      const origViewport = origPage.getViewport(viewportOpties(origPage, getPageRotation(pageNum)));
+      pagina = { breedtePt: origViewport.width, hoogtePt: origViewport.height };
+    }
+    const plaatsing = berekenPlaatsing({
+      papier: vel,
+      orientatie,
+      pagina,
+      schaling,
+      zoom,
+      centreren,
+    });
+    if (!plaatsing) throw new Error(`page ${pageNum} has no usable size`);
+    opVel = plaatsing.bekend;
+
+    const pxPerPt = uitsnede ? uitsnedePxPerPt(plaatsing, uitsnede) : printPxPerPt(plaatsing);
+    const deel = renderDeel(plaatsing, pxPerPt);
+    const canvas = await renderPrintBeeld(pageNum, pxPerPt, plaatsing, deel, { markeringen, kleur, uitsnede });
+    const beeld = beeldFormaatVoor(kleur) === 'png'
+      ? await pdf.embedPng(await canvasToBytes(canvas, 'png'))
+      : await pdf.embedJpg(await canvasToBytes(canvas, 'jpeg', 0.92));
+    voegPrintPaginaToe(pdf, plaatsing, deel, beeld);
+  }
+  return { pdf, opVel };
+}
+
+/**
+ * De markeringen van één pagina voor de vector-print-PDF: de annotatielaag
+ * (markeringen, watermerken, tekstbewerkingen) op een doorzichtig canvas, op
+ * de resolutie van de printopdracht, in stukken geknipt waar iets staat
+ * (print-vector.js). Een pagina zonder markeringen geeft niets, en dan staat er
+ * geen enkel beeld in het bestand. Per band gelezen: het beeld van een A0 op
+ * 300 dpi past niet in één keer in het geheugen.
+ * @returns {Promise<{ png: Uint8Array, opVel: object }[]>}
+ */
+async function markeringBeelden(pageNum, plaatsing, markeringen) {
+  const pxPerPt = printPxPerPt(plaatsing);
+  const deel = renderDeel(plaatsing, pxPerPt);
+  if (!deel) return [];
+  const page = await getActiveDocument().pdfDoc.getPage(pageNum);
+  const viewport = page.getViewport(viewportOpties(page, getPageRotation(pageNum), pxPerPt));
+  let canvas = await renderMarkeringenOffscreen(pageNum, pxPerPt, viewport, {
+    deel: ongedraaidDeel(plaatsing, pxPerPt, deel.px), markeringen,
+  });
+  if (plaatsing.gedraaid) canvas = kwartslagLinksom(canvas);
+
+  const raster = maakTegelRaster(canvas.width, canvas.height);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  for (let y = 0; y < canvas.height; y += raster.tegel) {
+    const hoogte = Math.min(raster.tegel, canvas.height - y);
+    raster.markeer(ctx.getImageData(0, y, canvas.width, hoogte).data, y, hoogte);
+  }
+  const uit = [];
+  for (const vak of vakkenUitRaster(raster)) {
+    const stuk = document.createElement('canvas');
+    stuk.width = vak.breedte;
+    stuk.height = vak.hoogte;
+    stuk.getContext('2d').drawImage(canvas, vak.x, vak.y, vak.breedte, vak.hoogte, 0, 0, vak.breedte, vak.hoogte);
+    uit.push({ png: await canvasToBytes(stuk, 'png'), opVel: vakOpVel(deel, vak) });
+  }
+  return uit;
+}
+
+/** De bytes waaruit het document nu getoond wordt (zoals saver.js ze zoekt). */
+async function bronBytesVan(doc) {
+  let bytes = doc.filePath ? getCachedPdfBytes(doc.filePath) : undefined;
+  if (!bytes) bytes = getCachedPdfBytes(`__memory__${doc.id}`);
+  if (!bytes && doc.filePath) bytes = await readBinaryFile(doc.filePath);
+  if (!bytes) throw new Error('no source bytes');
+  return bytes;
+}
+
+/**
+ * Het doel "Opslaan als PDF" van de printdialoog: bouw de print-PDF en schrijf
+ * de bytes naar `pad`. Geen spooler, geen stuurprogramma. Dezelfde paginakeuze,
+ * schaal, plek, vel en inhoud als een printopdracht, maar met de bronpagina's
+ * als vectoren (print-vector.js): tekst blijft tekst, en het vel ligt in het
+ * bestand zoals gekozen. Lukt dat niet (een bron die pdf-lib niet kan lezen,
+ * bijvoorbeeld versleuteld), dan de gerasterde print-PDF, en de melding zegt
+ * dat. Loopt op de achtergrond, met de zwevende voortgangsbalk. Bij een
+ * kleurmodus grijswaarden of zwart-wit (`kleur`, print-kleur.js) altijd de
+ * gerasterde print-PDF met omgezette paginabeelden: de kleuren in de
+ * vectorinhoud van de bron zijn niet betrouwbaar om te zetten.
+ *
+ * @param {{ pages:number[], pad:string,
+ *           orientatie?:'auto'|'portrait'|'landscape',
+ *           vel?: {breedteMm:number, hoogteMm:number}|'pagina'|null,
+ *           schaling?: string, zoom?: number, centreren?: boolean, inhoud?: string,
+ *           poster?: object|null, boekje?: boolean|{katern?:number, binding?:string, kanten?:string, omgekeerd?:boolean, draaiAchter?:boolean, kruipMm?:number},
+ *           openen?: ((pad:string) => void)|null,
+ *           uitsneden?: Map<number, object>|null,
+ *           afgebroken?: () => boolean }} opts
+ *   vel 'pagina' = elke pagina haar eigen vel, in de gekozen stand
+ *   (print-plaatsing.js); poster = de tegelkeuzes van de posterafdruk
+ *   (print-poster.js, posterOpties) of null; boekje: een geniet boekje
+ *   (print-boekje.js), twee pagina's per liggend vel, eventueel in katernen
+ *   ({ katern }); meerPerBlad: het raster (print-meerperblad.js), ook een
+ *   folder ({ flyer, snijtekens }); openen: achter de knop "Openen" op de melding na
+ *   afloop; afgebroken: wordt vlak vóór het schrijven gevraagd — zegt hij ja,
+ *   dan komt er geen bestand (de MCP-opdracht `app_print_to_pdf` gebruikt dat
+ *   voor haar eigen tijdgrens, zie print-opdracht.js).
+ * @returns {Promise<{ok:boolean, gerasterd?:boolean, afgebroken?:boolean, error?:string}>}
+ */
+export async function slaPrintOpAlsPdf({
+  pages, pad, orientatie = 'auto', vel = null, schaling: schalingKeuze = 'fit', zoom: zoomKeuze = 100,
+  centreren: centrerenKeuze = true, meerPerBlad: meerPerBladKeuze = null, poster = null, boekje = false,
+  inhoud = 'doc-and-markups', kleur = 'color', openen = null, afgebroken = () => false, uitsneden = null,
+}) {
+  // `orientatie` is de stand van het vel; de printpagina's krijgen bij
+  // pagina's per vel en een boekje hun eigen stand (bronOrientatie, #623).
+  const {
+    vel: bronVel, meerPerBlad, schaling, zoom, centreren, orientatie: bronOrientatie,
+  } = bronKeuzes({
+    poster, vel, meerPerBlad: meerPerBladKeuze, schaling: schalingKeuze, zoom: zoomKeuze,
+    centreren: centrerenKeuze, boekje, orientatie,
+  });
+  startPrintProgress(i18next.t('dialogs:print.progress.preparing'));
+  try {
+    const doc = getActiveDocument();
+    if (!doc?.pdfDoc) throw new Error(i18next.t('dialogs:print.progress.errNoDocument'));
+    const total = pages.length + 1;
+    const voortgang = (i, pageNum) => updatePrintProgress(
+      i18next.t('dialogs:print.progress.renderingPage', { page: pageNum, current: i + 1, total: pages.length }),
+      i / total,
+    );
+    const markeringen = markeringenVoorInhoud(inhoud);
+
+    let pdf;
+    let gerasterd = false;
+    try {
+      if (!vectorMogelijk(kleur)) throw new Error(`colour mode ${kleur} prints page images`);
+      // Huidige weergave (#947): de uitsneden bestaan alleen als paginabeeld.
+      if (uitsneden?.size) throw new Error('current view prints page images');
+      ({ pdf } = await bouwVectorPrintPdf({
+        // Met de geschakelde laagstand (#377): de afdruk toont wat in beeld is.
+        bronBytes: await (await import('./lagen-schakelen.js')).bytesMetLaagstand(doc, await bronBytesVan(doc)),
+        paginas: pages.map((pageNum) => ({ index: pageNum - 1, extraRotatie: getPageRotation(pageNum) })),
+        keuzes: { papier: bronVel, orientatie: bronOrientatie, schaling, zoom, centreren },
+        beelden: ({ index, plaatsing }) => markeringBeelden(index + 1, plaatsing, markeringen),
+        voortgang: (i, index) => voortgang(i, index + 1),
+      }));
+    } catch (e) {
+      if (vectorMogelijk(kleur) && !uitsneden?.size) console.warn('[print] vector print PDF failed; falling back to page images:', e);
+      gerasterd = true;
+      ({ pdf } = await bouwPrintPdf({
+        doc, pages, orientatie: bronOrientatie, vel: bronVel, schaling, zoom, centreren, inhoud, kleur, voortgang, uitsneden,
+      }));
+    }
+
+    pdf = await metMeerPerBlad(pdf, meerPerBlad, vel, orientatie);
+    pdf = await metBoekje(pdf, !poster && boekje, vel);
+    pdf = await metPoster(pdf, poster, { vel, orientatie, pages, doc });
+
+    updatePrintProgress(i18next.t('dialogs:print.progress.saving'), pages.length / total);
+    // Afgebroken (de tijdgrens van een MCP-opdracht): niets wegschrijven, want
+    // de aanroeper heeft allang een foutantwoord gekregen.
+    if (afgebroken()) {
+      failPrintProgress(i18next.t('dialogs:print.progress.saveFailed', { error: 'cancelled' }));
+      return { ok: false, afgebroken: true };
+    }
+    await writeBinaryFile(pad, await pdf.save());
+    // Een nieuw bestand op de site (#726): openen en tonen als dat bestand.
+    // Koos de gebruiker na een weigering van de site voor downloaden, dan is
+    // er geen bestand op de site: alleen de naam, en niets om te openen.
+    const doelPad = opgeslagenPad(pad);
+    const gedownload = !!leesHostNieuwPad(doelPad);
+    const getoond = leesHostPad(doelPad) || gedownload ? extractFileName(doelPad) : doelPad;
+    finishPrintProgress(
+      i18next.t(gerasterd ? 'dialogs:print.progress.savedAsImages' : 'dialogs:print.progress.savedTo', { path: getoond }),
+      {
+        actie: openen && !gedownload ? { label: i18next.t('common:open'), uitvoeren: () => openen(doelPad) } : null,
+        duur: 9000,
+      },
+    );
+    return { ok: true, gerasterd };
+  } catch (e) {
+    console.error('Save as PDF failed:', e);
+    failPrintProgress(i18next.t('dialogs:print.progress.saveFailed', { error: e?.message ?? e }));
+    return { ok: false, error: `${e?.message ?? e}` };
+  }
+}
+
+/**
+ * Meerdere pagina's per vel: zet de gebouwde print-PDF (één pagina per
+ * bronpagina) om naar vellen met een raster van pagina's. Bij meer dan één per
+ * vel werkt de schaalkeuze niet (elke pagina past in zijn cel): de bronpagina's
+ * worden dan passend en gecentreerd gebouwd.
+ * @param {PDFDocument} pdf
+ * @param {{kolommen:number, rijen:number, volgorde?:string, rand?:boolean}|null} meerPerBlad
+ */
+async function metMeerPerBlad(pdf, meerPerBlad, vel, orientatie) {
+  if (!isMeerPerBlad(meerPerBlad)) return pdf;
+  const papier = vel && typeof vel === 'object' ? vel : null;
+  return maakMeerPerBlad(pdf, { ...meerPerBlad, papier, orientatie });
+}
+
+/**
+ * Boekje (print-boekje.js): de print-PDF (één pagina per bronpagina, in
+ * printvolgorde) naar liggende vellen met twee pagina's per zijde in
+ * genietvolgorde, aangevuld tot een viervoud. `boekje` is true of een object
+ * met de boekje-opties (#607): { katern, binding, kanten, omgekeerd,
+ * draaiAchter, kruipMm } (zie maakBoekje).
+ */
+async function metBoekje(pdf, boekje, vel) {
+  if (!boekje) return pdf;
+  const opties = typeof boekje === 'object' ? boekje : {};
+  return maakBoekje(pdf, {
+    papier: vel && typeof vel === 'object' ? vel : null,
+    katern: opties.katern || 0,
+    binding: opties.binding,
+    kanten: opties.kanten,
+    omgekeerd: !!opties.omgekeerd,
+    draaiAchter: !!opties.draaiAchter,
+    kruipMm: opties.kruipMm || 0,
+  });
+}
+
+/** Het label van een tegel in de taal van de app (print-poster.js, posterLabel). */
+function posterVertaling(waarden) {
+  return i18next.t('dialogs:print.posterLabelText', waarden);
+}
+
+/** De naam van het document, voor de labels en de printjob. */
+function documentNaam(doc) {
+  return doc.fileName || (doc.filePath ? doc.filePath.split(/[\\/]/).pop() : '') || '';
+}
+
+async function metPoster(pdf, poster, { vel, orientatie, pages, doc }) {
+  if (!poster) return pdf;
+  return maakPoster(pdf, {
+    papier: vel, orientatie, opties: poster, paginaNummers: pages, bestand: documentNaam(doc), vertaal: posterVertaling,
+  });
+}
+
+/**
+ * Run a print job in the background. Fire-and-forget: the caller closes the
+ * dialog first, this drives the floating progress bar.
+ *
+ * The pages come from bouwPrintPdf; with pages laid out on the sheet
+ * print_pdf gets plaatsing 'vel' (1:1 on the physical sheet, lp without
+ * rescaling). Without a known sheet the behaviour from before the scale
+ * choice: each page at its own size, fitted in by the printer.
+ * @param {{ pages:number[], copies:number, printer:string,
+ *           orientatie?:'auto'|'portrait'|'landscape', papier?:string,
+ *           vel?: {breedteMm:number, hoogteMm:number}|null,
+ *           schaling?: string, zoom?: number, centreren?: boolean, inhoud?: string,
+ *           poster?: object|null, boekje?: boolean|{katern?:number, binding?:string, kanten?:string, omgekeerd?:boolean, draaiAchter?:boolean, kruipMm?:number},
+ *           kleur?: 'color'|'grayscale'|'bw', uitsneden?: Map<number, object>|null,
+ *           afgebroken?: () => boolean }} opts
+ *   uitsneden: Huidige weergave (#947), zie bouwPrintPdf.
+ *   kleur: de kleurmodus (print-kleur.js); de paginabeelden worden omgezet
+ *   voordat ze naar de spooler gaan, dus elke driver krijgt grijs of zwart-wit.
+ *   boekje: een geniet boekje (print-boekje.js), twee pagina's per liggend vel.
+ *   poster: de tegelkeuzes van de posterafdruk (print-poster.js) of null; de
+ *   vellen gaan dan altijd 1:1 naar de printer (plaatsing 'vel').
+ *   afgebroken: wordt gevraagd vlak vóór het spoolen — zegt hij ja, dan gaat er
+ *   niets naar de printer (de MCP-opdracht `app_print` gebruikt dat voor haar
+ *   eigen tijdgrens, zie print-opdracht.js).
+ * @returns {Promise<{ok:boolean, copies?:number, afgebroken?:boolean, error?:string}>}
+ */
+export async function runPrintJob({
+  pages, copies, printer, orientatie = 'auto', papier = 'printer',
+  vel = null, schaling: schalingKeuze = 'fit', zoom: zoomKeuze = 100, centreren: centrerenKeuze = true,
+  meerPerBlad: meerPerBladKeuze = null, poster = null, boekje = false, inhoud = 'doc-and-markups',
+  kleur = 'color', afgebroken = () => false, uitsneden = null,
+}) {
+  // `orientatie` is de stand van het vel (en gaat zo naar print_pdf); de
+  // printpagina's krijgen bij pagina's per vel en een boekje hun eigen stand
+  // (bronOrientatie, #623).
+  const {
+    vel: bronVel, meerPerBlad, schaling, zoom, centreren, orientatie: bronOrientatie,
+  } = bronKeuzes({
+    poster, vel, meerPerBlad: meerPerBladKeuze, schaling: schalingKeuze, zoom: zoomKeuze,
+    centreren: centrerenKeuze, boekje, orientatie,
+  });
+  startPrintProgress(i18next.t('dialogs:print.progress.preparing'));
+  try {
+    const doc = getActiveDocument();
+    if (!doc?.pdfDoc) throw new Error(i18next.t('dialogs:print.progress.errNoDocument'));
+    // Reserve the last slice of the bar for the spool step.
+    const total = pages.length + 1;
+    const { pdf: pagePdf, opVel: paginasOpVel } = await bouwPrintPdf({
+      doc, pages, orientatie: bronOrientatie, vel: bronVel, schaling, zoom, centreren, inhoud, kleur, uitsneden,
+      voortgang: (i, pageNum) => updatePrintProgress(
+        i18next.t('dialogs:print.progress.renderingPage', { page: pageNum, current: i + 1, total: pages.length }),
+        i / total,
+      ),
+    });
+
+    const newPdf = await metPoster(
+      await metBoekje(await metMeerPerBlad(pagePdf, meerPerBlad, vel, orientatie), !poster && boekje, vel),
+      poster, { vel, orientatie, pages, doc },
+    );
+    // De vellen van een poster liggen 1:1 (de tegels moeten op schaal blijven
+    // en mogen niet opnieuw ingepast worden).
+    const opVel = paginasOpVel || !!poster;
+
+    updatePrintProgress(i18next.t('dialogs:print.progress.saving'), pages.length / total);
+    // Afgebroken (de tijdgrens van een MCP-opdracht): niets spoolen.
+    if (afgebroken()) {
+      failPrintProgress(i18next.t('dialogs:print.progress.failed', { error: 'cancelled' }));
+      return { ok: false, afgebroken: true };
+    }
+    const pdfBytes = await newPdf.save();
+    // Documentnaam meegeven: de spooler toont de bestandsnaam van het
+    // tempbestand als printjob-naam, dus die moet naar de pdf zelf heten.
+    const jobName = documentNaam(doc) || null;
+    const tempPath = await invoke('write_temp_pdf', { data: Array.from(pdfBytes), name: jobName });
+    if (!tempPath) throw new Error(i18next.t('dialogs:print.progress.errTempFile'));
+
+    const numCopies = Math.max(1, copies);
+    for (let c = 0; c < numCopies; c++) {
+      updatePrintProgress(
+        numCopies > 1
+          ? i18next.t('dialogs:print.progress.sendingCopy', { current: c + 1, total: numCopies })
+          : i18next.t('dialogs:print.progress.sending'),
+        (pages.length + c / numCopies) / total
+      );
+      await invoke('print_pdf', {
+        path: tempPath, printer, orientatie, papier, ...(opVel ? { plaatsing: 'vel' } : {}),
+      });
+    }
+
+    finishPrintProgress(i18next.t('dialogs:print.progress.sent'));
+    // delete_file (not delete_temp_file — that command does not exist).
+    setTimeout(async () => { try { await invoke('delete_file', { path: tempPath }); } catch (_) {} }, 30000);
+    return { ok: true, copies: numCopies };
+  } catch (e) {
+    console.error('Print job failed:', e);
+    // De webversie heeft geen spooler. Dan geen technische opdrachtnaam in
+    // beeld, maar de ene melding over functies zonder webvariant (#456).
+    if (isNietInBrowser(e)) {
+      failPrintProgress(meldingTekst(i18next.t.bind(i18next), i18next.t('print')));
+      return { ok: false, error: 'not-in-browser' };
+    }
+    failPrintProgress(i18next.t('dialogs:print.progress.failed', { error: e?.message ?? e }));
+    return { ok: false, error: `${e?.message ?? e}` };
+  }
+}

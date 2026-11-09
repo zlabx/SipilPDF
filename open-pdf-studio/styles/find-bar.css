@@ -1,0 +1,583 @@
+/* ========================================
+   Find Bar — VS Code-inspired compact design
+   ======================================== */
+
+.find-bar {
+  display: none;
+  position: absolute;
+  top: 4px;
+  right: 12px;
+  z-index: 1000;
+  background: var(--theme-surface, #ffffff);
+  border: 1px solid var(--theme-border, #d4d4d4);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  padding: 4px;
+  align-items: flex-start;
+  gap: 2px;
+  font-family: var(--ui-font);
+  font-size: 12px;
+}
+
+.find-bar.visible {
+  display: flex;
+}
+
+/* Nooit breder dan het documentvenster: met geopende panelen (of op een klein
+   scherm) liep de balk links het venster uit en waren het begin van het
+   zoekveld en het eerste vinkje niet meer zichtbaar of aanklikbaar. */
+.find-bar {
+  max-width: calc(100% - 24px);
+  box-sizing: border-box;
+}
+
+/* --- Expand/collapse button --- */
+
+.find-expand-btn {
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: transparent;
+  color: var(--theme-text-secondary, #888);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+  cursor: default;
+  align-self: flex-start;
+  margin-top: 3px;
+}
+
+.find-expand-btn:hover {
+  color: var(--theme-text, #333);
+  background: var(--theme-hover, #e5e5e5);
+}
+
+/* --- Row layout --- */
+
+.find-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.find-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* --- Input with inline count --- */
+
+.find-input-wrapper {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--theme-border, #d4d4d4);
+  background: var(--theme-bg, #ffffff);
+  flex-shrink: 1;
+  min-width: 90px;
+  height: 24px;
+}
+
+.find-input-wrapper:focus-within {
+  border-color: var(--theme-accent, #0078d4);
+}
+
+.find-input-wrapper.not-found {
+  border-color: #e81123;
+  background: rgba(232, 17, 35, 0.06);
+}
+
+.find-input {
+  width: 180px;
+  min-width: 0;
+  padding: 0 6px;
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--theme-text, #333);
+  height: 100%;
+  outline: none;
+}
+
+.find-input::placeholder {
+  color: var(--theme-text-secondary, #999);
+}
+
+.find-count-inline {
+  font-size: 10px;
+  color: var(--theme-text-secondary, #888);
+  white-space: nowrap;
+  padding: 0 6px;
+  flex-shrink: 0;
+  user-select: none;
+  min-width: 50px;
+  text-align: right;
+}
+
+.find-count-inline.is-searching {
+  color: var(--theme-accent, #0078d4);
+}
+
+/* --- Replace input --- */
+
+.replace-input-wrapper {
+  height: 24px;
+}
+
+.replace-input-wrapper .find-input {
+  width: 180px;
+}
+
+/* --- Buttons (nav + toggles) --- */
+
+.find-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--theme-text-secondary, #888);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+  cursor: default;
+}
+
+.find-btn:hover:not(:disabled) {
+  background: var(--theme-hover, #e5e5e5);
+  color: var(--theme-text, #333);
+}
+
+.find-btn:active:not(:disabled) {
+  background: var(--theme-active, #d5d5d5);
+}
+
+.find-btn:disabled {
+  opacity: 0.35;
+}
+
+/* --- Replace buttons --- */
+
+.replace-btn,
+.replace-all-btn {
+  width: 22px;
+  height: 22px;
+}
+
+/* --- Separator --- */
+
+.find-separator {
+  width: 1px;
+  height: 16px;
+  background: var(--theme-border, #d4d4d4);
+  margin: 0 2px;
+  flex-shrink: 0;
+}
+
+/* --- Toggle buttons (Match Case, Whole Word, Highlight All) --- */
+
+.find-toggle-btn {
+  width: 24px;
+  height: 22px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--theme-text-secondary, #888);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: default;
+  font-family: inherit;
+}
+
+.find-toggle-btn:hover {
+  background: var(--theme-hover, #e5e5e5);
+  color: var(--theme-text, #333);
+}
+
+.find-toggle-btn.active {
+  background: var(--theme-accent, #0078d4);
+  color: #ffffff;
+  border-color: var(--theme-accent, #0078d4);
+}
+
+.find-toggle-btn.active:hover {
+  opacity: 0.9;
+}
+
+/* --- Close button --- */
+
+.find-close-btn {
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--theme-text-secondary, #888);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+  margin-left: 2px;
+  cursor: default;
+}
+
+.find-close-btn:hover {
+  background: #e81123;
+  color: #ffffff;
+}
+
+/* --- Zoekbronnen (Tekst / Annotaties) --- */
+
+.find-sources {
+  gap: 10px;
+  padding: 0 2px;
+}
+
+.find-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--theme-text, #333);
+  user-select: none;
+  cursor: default;
+}
+
+.find-check input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  cursor: default;
+}
+
+.find-sources-hint {
+  font-size: 10px;
+  color: var(--theme-text-secondary, #888);
+  white-space: nowrap;
+}
+
+/* --- Resultatenlijst per pagina --- */
+
+.find-results {
+  border-top: 1px solid var(--theme-border, #d4d4d4);
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+}
+
+.find-results-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: var(--theme-text, #333);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  padding: 3px 2px;
+  cursor: default;
+}
+
+.find-results-header:hover {
+  background: var(--theme-hover, #e5e5e5);
+}
+
+.find-results-caret {
+  font-size: 9px;
+  width: 10px;
+  color: var(--theme-text-secondary, #888);
+}
+
+/* De lijst groeit mee met het aantal pagina's met treffers, tot ruim een
+   derde van het venster (nooit minder dan 150 px), en scrolt daarna (#686). */
+.find-results-list {
+  max-height: max(150px, 40vh);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.find-results-row {
+  display: flex;
+  /* Niet krimpen: met overflow: hidden mag een flex-item anders tot 0 hoog
+     worden, en schoven de regels bij veel treffers over elkaar (#686). */
+  flex-shrink: 0;
+  overflow: hidden;
+  align-items: baseline;
+  gap: 6px;
+  border: none;
+  border-left: 3px solid transparent;
+  background: transparent;
+  color: var(--theme-text, #333);
+  font-family: inherit;
+  font-size: 11px;
+  text-align: left;
+  padding: 2px 6px 2px 4px;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.find-results-row:hover {
+  background: var(--theme-hover, #e5e5e5);
+}
+
+.find-results-row.current {
+  border-left-color: #ff8c00;
+  background: rgba(255, 165, 0, 0.14);
+  font-weight: 600;
+}
+
+.find-results-count,
+.find-results-kinds {
+  color: var(--theme-text-secondary, #888);
+  font-weight: normal;
+}
+
+/* --- Not found message (shown below the bar) --- */
+
+.find-message {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 2px;
+  font-size: 11px;
+  color: #e81123;
+  background: var(--theme-surface, #ffffff);
+  border: 1px solid #e81123;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+/* ========================================
+   Search Highlight Styles
+   ======================================== */
+
+.search-highlight {
+  position: absolute;
+  background-color: rgba(255, 255, 0, 0.4);
+  pointer-events: none;
+  mix-blend-mode: multiply;
+}
+
+.search-highlight.current {
+  background-color: rgba(255, 165, 0, 0.6);
+  outline: 2px solid #ff8c00;
+}
+
+/* Annotatietreffer: een kader om de annotatie in plaats van een vlak over de
+   letters — de tekst van een annotatie staat niet in de tekstlaag. */
+.search-highlight-annotation {
+  background-color: rgba(255, 255, 0, 0.18);
+  outline: 2px solid rgba(214, 187, 0, 0.9);
+  outline-offset: 1px;
+}
+
+.search-highlight-annotation.current {
+  background-color: rgba(255, 165, 0, 0.25);
+  outline-color: #ff8c00;
+}
+
+/* --- More search options (symbols, other documents) --- */
+
+.find-options {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.find-options-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 2px;
+  z-index: 1001;
+  min-width: 160px;
+  display: flex;
+  flex-direction: column;
+  padding: 2px 0;
+  background: var(--theme-surface, #ffffff);
+  border: 1px solid var(--theme-border, #d4d4d4);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.find-options-item {
+  position: relative;
+  display: block;
+  width: 100%;
+  padding: 4px 12px 4px 24px;
+  border: none;
+  background: transparent;
+  color: var(--theme-text, #333);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.find-options-item:hover {
+  background: var(--theme-hover, #e5e5e5);
+}
+
+.find-options-item.checked::before {
+  content: '\2713';
+  position: absolute;
+  left: 8px;
+}
+
+/* --- Search in other documents (extra row, via the options menu) --- */
+
+.document-search {
+  min-width: 0;
+  max-width: 680px;
+  color: var(--theme-text, #222);
+}
+
+.document-search .find-row {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.document-search section {
+  padding: 6px 0;
+  border-top: 1px solid var(--theme-border, #d4d4d4);
+}
+
+.document-search section button {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
+.document-search p {
+  margin: 4px 0;
+}
+
+.document-search-results {
+  max-height: 40vh;
+  overflow: auto;
+}
+
+.document-search button,
+.document-search select {
+  color: var(--theme-text, #222);
+  background: var(--theme-surface, #fff);
+  border: 1px solid var(--theme-border, #d4d4d4);
+  border-radius: 0;
+  padding: 3px 6px;
+  font: inherit;
+  cursor: default;
+}
+
+.document-search button:disabled {
+  opacity: .5;
+}
+
+.document-search button:not(:disabled):hover {
+  background: var(--theme-hover, #eee);
+}
+
+/* ========================================
+   Read aloud bar (#384): same frame as the find bar, top left
+   ======================================== */
+
+.read-aloud-bar {
+  display: flex;
+  position: absolute;
+  top: 4px;
+  left: 12px;
+  z-index: 1000;
+  max-width: calc(100% - 24px);
+  box-sizing: border-box;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: var(--theme-surface, #ffffff);
+  border: 1px solid var(--theme-border, #d4d4d4);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  font-family: var(--ui-font);
+  font-size: 12px;
+  color: var(--theme-text, #333);
+}
+
+.read-aloud-btn {
+  width: 24px;
+  height: 22px;
+  border: 1px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--theme-text, #333);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.read-aloud-btn:hover:not(:disabled) {
+  background: var(--theme-hover, #e5e5e5);
+  border-color: var(--theme-border, #d4d4d4);
+}
+
+.read-aloud-btn:disabled {
+  opacity: 0.4;
+}
+
+.read-aloud-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.read-aloud-btn.close:hover {
+  background: #e81123;
+  border-color: #e81123;
+  color: #ffffff;
+}
+
+.read-aloud-bar select {
+  font-size: 12px;
+  height: 22px;
+  max-width: 180px;
+  border: 1px solid var(--theme-border, #d4d4d4);
+  border-radius: 0;
+  background: var(--theme-input-bg, var(--theme-surface, #ffffff));
+  color: var(--theme-text, #333);
+}
+
+.read-aloud-online {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  white-space: nowrap;
+  color: var(--theme-text, #333);
+}
+
+.read-aloud-online input {
+  margin: 0;
+}
+
+.read-aloud-status {
+  color: var(--theme-text-secondary, #666);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  max-width: 260px;
+}
+
+.read-aloud-status.warning {
+  color: #c42b1c;
+  white-space: normal;
+}

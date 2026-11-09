@@ -1,0 +1,87 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-web-unit/
+open-pdf-studio/dist-webbundel/
+out/
+
+# Rust / Cargo build output — elke target-map op elk niveau
+# (root workspace, open-pdf-render, src-tauri) plus losse iteratie-varianten
+target/
+target-*/
+
+# pdfium-worker-sidecar: build-artefact dat build.rs/CI zelf plaatsen
+binaries/pdfium-worker-*
+# Verkenner-miniatuurhandler (#605): door build.rs/CI uit de target-map gekopieerd
+open-pdf-studio/src-tauri/binaries/open-pdf-thumbnails.dll
+
+# macOS in-proc PDFium: door CI opgehaald (SHA-256-geverifieerd), niet gecommit
+binaries/macos-universal/
+
+# OCR runtime assets (Tesseract trained-data + CJK font): opgehaald door
+# scripts/ocr-runtime.mjs (SHA-256-geverifieerd), niet gecommit.
+open-pdf-studio/src-tauri/resources/tessdata/
+open-pdf-studio/src-tauri/resources/fonts/
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
+
+# Test files
+*.jpg
+*.png
+!open-pdf-studio/public/icon.png
+!open-pdf-studio/public/pdfjs/**
+!open-pdf-studio/src-tauri/icons/**
+!open-pdf-studio/assets/nen1414/**
+!snap/gui/open-pdf-studio.png
+!docs/screenshots/**
+!docs/images/readme/**
+
+# Temporary files
+temp/
+
+# Internal notes
+Missing.md
+Plan/
+
+# Documentation
+open-pdf-studio/ROADMAP.md
+
+# Backup files
+*.backup
+PROMPTS.md
+
+# Render regression test harness
+test pdf-bestanden/render-regression-runs/
+scripts/.venv-test/
+open-pdf-studio/dev-build-nr.json
+/testdata/
+
+# Python-bytecode van de verificatiescripts
+__pycache__/
+
+# Lokale manifesten van de verificatiescripts (namen van testbestanden)
+open-pdf-cad/scripts/*.local.json
+
+# Flatpak: offline sources are generated from the lockfiles
+# (node flatpak/generate-sources.mjs); flatpak-builder state and output.
+flatpak/generated-sources-*.json
+.flatpak-builder/
+/builddir/
+/repo/
+/flathub-out/
+*.flatpak

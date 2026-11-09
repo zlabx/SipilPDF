@@ -1,0 +1,4304 @@
+//! In-process MCP server. Started by `--mcp-server` CLI flag and used by the
+//! render-regression-test harness to drive the renderer over JSON-RPC. Refuses
+//! to start in release builds unless the `OPS_ENABLE_MCP=1` environment
+//! variable is set, so production users can never accidentally expose the
+//! server.
+//!
+//! ## Why hand-rolled instead of `rmcp`?
+//!
+//! The plan originally targeted `rmcp = "0.7"` with a `transport-streamable-
+//! http-server` feature. The published `rmcp` crate has shifted to a
+//! macro-driven `tool_router` / `tool_handler` design (1.x) that requires
+//! `schemars` and a particular ToolRouter wiring pattern, and the public
+//! types/feature-flags have moved between minor versions. Since this scaffold
+//! only needs three JSON-RPC methods (`initialize`, `tools/list`,
+//! `tools/call`), we use plain `axum` + `serde_json` and dispatch on the
+//! method string. Tool-handler logic added in tasks 6-9 plugs into the
+//! existing `tools/call` match arm.
+//!
+//! ## Wire protocol
+//!
+//! POST `/mcp` with a JSON-RPC 2.0 request body. Responses are JSON-RPC 2.0
+//! response objects (no SSE streaming — clients that need streaming should
+//! poll, but the harness uses request/response only).
+//!
+//! ## Test corpus directory
+//!
+//! `test_pdfs_dir` is captured at server-start time and stashed in the
+//! `AppState` so future tool handlers (Task 6: `list_test_pdfs`) can resolve
+//! relative paths without touching the process CWD again.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::post,
+    Json, Router,
+};
+use serde_json::{json, Value};
+use tauri::{AppHandle, Manager};
+
+use crate::mcp_app_bridge::{self, McpAppBridge};
+use crate::mcp_extensie_tools::{self, ExtensieTools};
+use crate::mcp_tool_meta::{beschikbaar, meta, Profiel};
+
+/// Per-server state. Cloned (cheaply, via Arc) into every request handler.
+///
+/// `app_handle` is `Some` whenever the MCP server is launched from inside
+/// `tauri::Builder::setup()` (the normal `--mcp-server` path). It is `None`
+/// for unit tests that drive the handlers directly without a running Tauri
+/// instance — in that case the `app_*` tools return an "app not available"
+/// error instead of panicking.
+#[derive(Clone)]
+pub struct AppState {
+    pub test_pdfs_dir: Arc<PathBuf>,
+    pub app_handle: Option<AppHandle>,
+    /// Welke gereedschappen deze server aanbiedt — zie mcp_tool_meta.rs.
+    pub profiel: Profiel,
+    /// De poort waarop we luisteren; de Host-kop moet daarbij passen.
+    pub poort: u16,
+    /// Wie de server mag gebruiken: lokale clients, of (OpenAEC Linux) wie het
+    /// geheim kent.
+    pub toegang: Toegang,
+}
+
+/// Toegangsregel van een MCP-server.
+#[derive(Clone)]
+pub enum Toegang {
+    /// Alleen 127.0.0.1/localhost (startvlag en instelling).
+    Lokaal,
+    /// OpenAEC Linux (#863): elk adres in het interne netwerk, maar alleen met
+    /// `Authorization: Bearer <geheim>` en zonder `Origin`-kop (geen browser).
+    Geheim(Arc<str>),
+}
+
+impl AppState {
+    pub fn nieuw(profiel: Profiel, poort: u16, app_handle: Option<AppHandle>) -> Self {
+        AppState {
+            test_pdfs_dir: Arc::new(resolve_test_pdfs_dir(
+                std::env::var_os("OPS_TEST_PDFS_DIR").map(PathBuf::from),
+            )),
+            app_handle,
+            profiel,
+            poort,
+            toegang: Toegang::Lokaal,
+        }
+    }
+}
+
+/// Resolve the corpus independently of the process working directory.
+/// CI can point at a small committed fixture set; local runs default to the
+/// repository corpus next to the workspace root.
+pub fn resolve_test_pdfs_dir(override_dir: Option<PathBuf>) -> PathBuf {
+    override_dir.unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("test pdf-bestanden")
+            .join("Originele bestanden")
+    })
+}
+
+/// Standard JSON-RPC error codes used by this server. Codes not yet
+/// dispatched in handler bodies are kept available for tool handlers added
+/// in tasks 7-9.
+#[allow(dead_code)]
+mod jsonrpc_error {
+    pub const PARSE_ERROR: i32 = -32700;
+    pub const INVALID_REQUEST: i32 = -32600;
+    pub const METHOD_NOT_FOUND: i32 = -32601;
+    pub const INVALID_PARAMS: i32 = -32602;
+    pub const INTERNAL_ERROR: i32 = -32603;
+}
+
+/// Build a JSON-RPC 2.0 success response.
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+/// Build a JSON-RPC 2.0 error response.
+fn rpc_error(id: Value, code: i32, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into(),
+        },
+    })
+}
+
+/// Handle the MCP `initialize` method. Identifies the server and advertises
+/// the `tools` capability (the actual list will populate as tasks 6-9 land).
+fn handle_initialize() -> Value {
+    json!({
+        "protocolVersion": "2025-03-26",
+        "serverInfo": {
+            "name": "open-pdf-studio",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "capabilities": {
+            "tools": {
+                "listChanged": false
+            }
+        },
+    })
+}
+
+/// Beschrijving van `app_import_cad` (#400). Een eigen functie: binnen de grote
+/// lijst zou dit ene gereedschap de uitvouwdiepte van `json!` overschrijden.
+fn import_cad_tool() -> Value {
+    json!(
+        {
+            "name": "app_import_cad",
+            "description": "Import a DWG or DXF drawing as a vector PDF page, without opening the import dialog. Choose the space (model space or a layout), the scale, the paper size, the layers and what happens with the result: a new document, a new page after the current one, or an underlay on the current page. Settings that are left out take the value the import dialog remembered, otherwise its default. Returns the pages that were made, warnings about anything that could not be converted and the names of external files. Fails while the import dialog is open.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path":               { "type": "string", "description": "Absolute path of the .dwg or .dxf file." },
+                    "space":              { "type": "string", "description": "\"model\" or the name of a layout (default: what the file suggests)." },
+                    "target":             { "type": "string", "enum": ["new", "append", "underlay"], "description": "new = a new document (default), append = a new page after the current page, underlay = on the current page. append without an open document becomes new." },
+                    "opacity":            { "type": "number", "description": "Opacity of an underlay, 0.05 to 1 (default 0.5). Only with target underlay." },
+                    "scale":              { "type": "number", "description": "Denominator N of 1:N. 0 fits the drawing on the paper." },
+                    "area":               { "type": "string", "enum": ["extents", "limits"], "description": "What part of the model space is converted." },
+                    "window":             { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4, "description": "Convert only this window: [x0, y0, x1, y1] in drawing units. Excludes area." },
+                    "paper":              { "type": "string", "enum": ["auto", "A4", "A3", "A3L", "A2", "A2L", "A1", "A1L", "A0", "Letter", "Tabloid", "custom"], "description": "Paper size. A layout keeps its own paper unless this is given." },
+                    "paperWidthMm":       { "type": "number", "description": "Width in mm for paper custom." },
+                    "paperHeightMm":      { "type": "number", "description": "Height in mm for paper custom." },
+                    "orientation":        { "type": "string", "enum": ["auto", "portrait", "landscape"] },
+                    "marginMm":           { "type": "number", "description": "Margin around the drawing in mm, 0 to 200." },
+                    "placement":          { "type": "string", "enum": ["center", "lower_left", "origin"] },
+                    "rotation":           { "type": "number", "description": "Rotate the drawing before placing it, in degrees." },
+                    "units":              { "type": "string", "enum": ["file", "mm", "cm", "m", "in", "ft"], "description": "Drawing unit; file = the unit in the file." },
+                    "layersOff":          { "type": "array", "items": { "type": "string" }, "description": "Layer names to leave out, on top of the layers the file switches off." },
+                    "layersOn":           { "type": "array", "items": { "type": "string" }, "description": "Layer names to include although the file switches them off." },
+                    "layersAsOcg":        { "type": "boolean", "description": "Keep the layers as PDF layers." },
+                    "includeOffLayers":   { "type": "boolean", "description": "Include switched-off layers as hidden PDF layers instead of leaving them out." },
+                    "colors":             { "type": "string", "enum": ["file", "black", "gray", "mono", "single"], "description": "Colour mode." },
+                    "monoThreshold":      { "type": "number", "description": "Brightness threshold in percent for colors mono, 0 to 100." },
+                    "singleColor":        { "type": "string", "description": "Colour #RRGGBB for colors single." },
+                    "lineweight":         { "type": "string", "enum": ["file", "fixed", "pens"], "description": "Line weights from the file, one fixed weight, or the colour table in pens." },
+                    "lineweightMm":       { "type": "number", "description": "Line weight in mm for lineweight fixed." },
+                    "pens":               { "type": "array", "items": { "type": "object" }, "description": "Colour table for lineweight pens: [{ \"color\": \"#RRGGBB\", \"lineweightMm\": 0.35 }]." },
+                    "fonts":              { "type": "array", "items": { "type": "object" }, "description": "Font replacements: [{ \"from\": \"name in the drawing\", \"family\": \"sans\" or \"mono\", \"bold\": false, \"italic\": false }]." },
+                    "hatch":              { "type": "string", "enum": ["all", "solid_only", "outline", "none"] },
+                    "text":               { "type": "boolean", "description": "Convert text." },
+                    "xrefs":              { "type": "boolean", "description": "Load external references." },
+                    "images":             { "type": "boolean", "description": "Embed images." },
+                    "reuseBlocks":        { "type": "boolean", "description": "Store repeated blocks once in the PDF." },
+                    "maxImageMegapixels": { "type": "number", "description": "Largest image that is embedded, in megapixels, 1 to 200." },
+                    "searchPaths":        { "type": "array", "items": { "type": "string" }, "description": "Extra folders to look in for external references and images." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }
+    )
+}
+
+/// Beschrijving van `app_export_cad` (#400): de tegenhanger van
+/// `app_import_cad`, langs dezelfde weg als het exportvenster.
+fn export_cad_tool() -> Value {
+    json!(
+        {
+            "name": "app_export_cad",
+            "description": "Export pages of the current document to DXF or DWG, without opening the export dialog. Reads the file on disk (save first); one page writes to `path`, several pages get `_p<page>` behind the name. Settings that are left out take the value the export dialog remembered, otherwise its default. Returns the files that were written with their object counts, warnings and, on a failure, a code (tooLarge, noModelSpace, modelSpaceAmbiguous, modelUnitsUnknown, failed). Fails while the export dialog is open.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path":        { "type": "string", "description": "Absolute path of the target file (.dxf or .dwg). Gives the format when format is left out." },
+                    "pages":       { "type": "string", "description": "\"current\" (default), \"all\" or a range like \"1-3,5\"." },
+                    "format":      { "type": "string", "enum": ["dxf", "dxf_binary", "dwg"], "description": "Output format; sets the extension of path." },
+                    "origin":      { "type": "string", "enum": ["page", "area", "model"], "description": "Where (0,0) of the drawing is: the lower left of the page (default), of the area, or the original model coordinates of an imported page." },
+                    "area":        { "type": "array", "items": { "type": "number" }, "minItems": 4, "maxItems": 4, "description": "Export only this window: [x0, y0, x1, y1] in page points with the origin at the top left, as annotations are positioned." },
+                    "annotations": { "type": "boolean", "description": "Include the annotations on layers OPS_<type>." },
+                    "scaleMode":   { "type": "string", "enum": ["paper", "measure", "custom"], "description": "paper = paper size, measure = the measure scale of the app at the area or page (default), custom = 1:scale." },
+                    "scale":       { "type": "number", "description": "Denominator N of 1:N for scaleMode custom (implies it)." },
+                    "layers":      { "type": "string", "enum": ["ocg_then_style", "style", "single"], "description": "PDF layers then line style, line style only, or one layer." },
+                    "units":       { "type": "string", "enum": ["mm", "cm", "m", "in"], "description": "Drawing unit of the output." },
+                    "layersOff":   { "type": "array", "items": { "type": "string" }, "description": "Layer names (as the export makes them) to leave out." },
+                    "allowLarge":  { "type": "boolean", "description": "Export a page with more objects than the limit anyway (default false: such a page fails with code tooLarge)." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }
+    )
+}
+
+/// Beschrijving van `app_export_ifcx` (#876, beta): de PDF als IFCX (IFC5,
+/// JSON), langs dezelfde weg als het exportvenster (js/pdf/ifcx-export.js).
+fn export_ifcx_tool() -> Value {
+    json!(
+        {
+            "name": "app_export_ifcx",
+            "description": "Convert pages of the current document to an IFCX file (beta; the JSON-based IFC5 format, alpha schema) without opening the export dialog. It writes one sheet node per page with the page size, label, rotation and measurement scale, the vector paths, text runs and embedded images on their own layers, and the annotations of the app on a separate layer (drafting components keep their IFC class). Page content comes from the last saved state of the PDF; annotations are current. A page with more paths than the limit keeps the first ones and the answer warns about the rest; once the file reaches its size limit (320 M characters) the remaining pages are left out with a warning. Refused for a document opened with a password. Replaces an existing file at `path`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path":            { "type": "string", "description": "Absolute path of the target file (.ifcx)." },
+                    "pages":           { "type": "string", "description": "\"all\" (default), \"current\" or a range like \"1-3,5\"." },
+                    "raster":          { "type": "boolean", "description": "Include embedded images (default true)." },
+                    "text":            { "type": "boolean", "description": "Include the text runs of the pages (default true)." },
+                    "annotations":     { "type": "boolean", "description": "Include the annotations on their own layer (default true)." },
+                    "maxPathsPerPage": { "type": "integer", "description": "Limit of paths per page (default 50000); the rest of a heavier page is left out with a warning." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }
+    )
+}
+
+/// De papierformaten die de printgereedschappen kennen; dezelfde lijst en
+/// dezelfde schrijfwijze als de Pagina-instelling (js/pdf/print-pagina-
+/// instelling.js, PAPIERFORMATEN) en als js/pdf/print-opdracht.js.
+const PRINT_PAPIERFORMATEN: &[&str] = &[
+    "A0", "A1", "A2", "A3", "A4", "A5", "A0L", "A1L", "A2L", "A3L", "Letter", "Legal", "Tabloid",
+];
+
+/// De papierkeuzes van een printgereedschap: de formaten plus één keuze die
+/// alleen daar past ("page" zonder printer, "printer" met printer).
+fn print_papier_keuzes(eigen: &str) -> Value {
+    let mut keuzes = vec![Value::from(eigen)];
+    keuzes.extend(PRINT_PAPIERFORMATEN.iter().map(|s| Value::from(*s)));
+    Value::Array(keuzes)
+}
+
+/// De argumenten die `app_print_to_pdf` en `app_print` gemeen hebben: de
+/// pagina's, het vel, de schaal en wat er wordt afgedrukt. Eén functie, zodat
+/// beide gereedschappen dezelfde keuzes en dezelfde teksten houden.
+fn print_gedeelde_eigenschappen(papier: &str) -> serde_json::Map<String, Value> {
+    let papier_tekst = if papier == "page" {
+        "Sheet size. \"page\" = every page on a sheet of its own size. Left out: the paper the Page Setup of this document asks for, otherwise \"page\"."
+    } else {
+        "Sheet size. \"printer\" = the paper that is in the printer. Left out: the paper the Page Setup of this document asks for, otherwise \"printer\"."
+    };
+    let mut props = serde_json::Map::new();
+    props.insert("pages".into(), json!({ "type": "string", "description": "\"all\" (default), \"current\" or a range like \"1-3,5\"." }));
+    props.insert("paper".into(), json!({
+        "type": "string",
+        "enum": print_papier_keuzes(papier),
+        "description": papier_tekst
+    }));
+    props.insert("orientation".into(), json!({ "type": "string", "enum": ["auto", "portrait", "landscape"], "description": "Orientation of the sheet; \"auto\" follows the page, as Auto-rotate in the dialog does. Left out: what the next print would already get." }));
+    props.insert("autoRotate".into(), json!({ "type": "boolean", "description": "true means orientation \"auto\"; false takes the orientation from Page Setup, otherwise portrait. May not contradict orientation." }));
+    props.insert("scaling".into(), json!({ "type": "string", "enum": ["fit", "shrink", "actual", "custom-scale"], "description": "fit = fit on the sheet, shrink = only shrink when the page does not fit, actual = real size, custom-scale = the percentage in zoom." }));
+    props.insert("zoom".into(), json!({ "type": "number", "description": "Page zoom in percent, 10 to 400. Implies scaling \"custom-scale\"." }));
+    props.insert("center".into(), json!({ "type": "boolean", "description": "Centre the page on the sheet." }));
+    props.insert("content".into(), json!({ "type": "string", "enum": ["document", "document-and-markups"], "description": "\"document\" leaves the annotation layer out; watermarks and text edits stay, they are document content." }));
+    props
+}
+
+/// Beschrijving van `app_print_to_pdf`: de afdruk als PDF wegschrijven, langs
+/// het doel "Opslaan als PDF" van het printvenster.
+fn print_to_pdf_tool() -> Value {
+    let mut props = print_gedeelde_eigenschappen("page");
+    props.insert("path".into(), json!({ "type": "string", "description": "Absolute path of the PDF file to write (.pdf). A file that is open in the app is refused." }));
+    json!({
+        "name": "app_print_to_pdf",
+        "description": "Print the current document to a PDF file, without opening the print dialog. Takes the route of the \"Save as PDF\" target in that dialog: no printer and no driver, the app writes the print PDF itself, so text stays text and the sheet lies in the file exactly as chosen. Settings that are left out take the value the print dialog remembered, otherwise its default; `pages` always starts at all pages. Returns the sheet size and orientation per page, the scale that was used and warnings about pages that do not fit. Fails while the print dialog is open.",
+        "inputSchema": {
+            "type": "object",
+            "properties": props,
+            "required": ["path"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// Beschrijving van `app_print`: dezelfde afdruk, maar naar een printer.
+fn print_tool() -> Value {
+    let mut props = print_gedeelde_eigenschappen("printer");
+    props.insert("printer".into(), json!({ "type": "string", "description": "Name of the print queue, exactly as app_list_printers reports it." }));
+    props.insert("copies".into(), json!({ "type": "number", "description": "Number of copies, 1 to 999 (default: what the print dialog remembered)." }));
+    json!({
+        "name": "app_print",
+        "description": "Print the current document to a printer, without opening the print dialog. Same page selection, paper, scale, position and content as that dialog, and the same background job. Settings that are left out take the value the print dialog remembered, otherwise its default; `pages` always starts at all pages. Returns the printer, the sheet with its orientation, the scale that was used, the number of copies and warnings about pages that do not fit. Paper really comes out of the printer, so ask the user before calling this. Fails on an unknown printer and while the print dialog is open.",
+        "inputSchema": {
+            "type": "object",
+            "properties": props,
+            "required": ["printer"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// Beschrijving van `app_floorplan`: de drie relaties van een bouwkundige
+/// plattegrond — een sparing hoort bij een wand, een ruimte bij de wanden
+/// eromheen, een maat bij wat hij meet.
+fn floorplan_tool() -> Value {
+    json!({
+        "name": "app_floorplan",
+        "description": "Draw a building floor plan with the parts related to each other, instead of loose shapes stacked on top of one another. Four actions. \"wall\" draws ONE wall run with its openings: the wall is split at every door and window, so the opening really interrupts the wall (the hatch stops at the reveal) and the frame symbol sits in the gap at the wall's own thickness and angle; it returns the wall segment ids in order. Doors and windows are drawn as real frames: timber stiles (67 x 114 mm by default) with a rebate, double glazing or a 40 mm door leaf with its swing. With layers the run is a layered (cavity) wall: start/end are its outside face, every drawn layer gets its own wall segments cut to its own opening (the outer leaf overlaps the frame, the insulation closes against it, the inner leaf keeps a reveal with clearance), the frame stands in the cavity behind the outer leaf, and runs whose outside faces meet in a corner are mitred layer by layer. \"rooms\" derives the enclosed rooms from the walls on a page - net area (inside the wall faces), perimeter and a label point that always falls inside the room - and reports wall ends that leave the contour open instead of silently filling half an area; a door opening does not break the enclosure. With place:true it puts each room on the sheet as a quiet room area (thin grey outline, no hatch or fill, drawn behind the walls and frames) plus ONE movable room tag, remembering the seed point. The room itself carries the name and the optional number (kept on save and reopen); the tag shows the room's name, number and net area. Placing a room that is already on the sheet adds no second area, only a tag if it has none. A click never selects a room (walls, frames and dimensions always win); reach it through its tag. names:[{id or x,y, name, number}] sets name and number on placed rooms; rooms and inspect report id, name, number and tagIds of placed rooms. With refresh:true it re-derives them from the walls as they are now, so a room that grew because a wall moved updates its area and its tag, and the tag keeps its place relative to the room. \"dimensions\" places a dimension chain along a wall run (pier, opening, pier, ...) plus an overall dimension, measured the way a draughtsman does: every point is ANCHORED to the wall face on the side of the chain (for a facade built from separate layers, the face of the outermost layer), and the end points sit on the outer corner of the building, also where the own segment stops short at a butt joint. The dimensions show the number only, black and thin, with extension lines that start a small gap from the wall face and run just past the dimension line, and the dimension line runs a little past the outer extension lines (sizes in paper millimetres, so they do not change with the drawing scale); the default distances grow with the drawing scale so text never runs into the lines. With refresh:true every anchored dimension on the page is recomputed the same way, and a dimension whose wall disappeared is reported as detached rather than broken. With chainOf (the id of any dimension) plus addPoints and/or removePoints an existing dimension or chain is extended or shortened in place: a point between two extension lines splits that segment, a point outside makes the chain longer, removing a point merges two segments; the overall dimension follows, the new segments copy the style of their neighbour, and a point on a wall face is anchored to that wall. A single dimension extended this way becomes a chain. \"inspect\" reads back what is on the page: walls with their length and thickness, openings with width, sill and height, the rooms it finds, open contour ends and how many anchored dimensions there are. Coordinates are page points at 100% zoom; sizes are real millimetres, so the page needs a measurement scale (app_set_measure_scale) first. Everything one call creates or changes goes into a single undo step.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action":       { "type": "string", "enum": ["inspect", "wall", "rooms", "dimensions"], "description": "What to do." },
+                "page":         { "type": "number", "description": "1-based page (default: the current page)." },
+                "start":        { "type": "object", "description": "wall: start of the run as {x, y} in page points (the wall centre line; with layers the outside face of the wall).", "additionalProperties": true },
+                "end":          { "type": "object", "description": "wall: end of the run as {x, y} in page points.", "additionalProperties": true },
+                "thicknessMm":  { "type": "number", "description": "wall: real wall thickness in mm (default 100)." },
+                "material":     { "type": "string", "description": "wall: hatch material id, e.g. nen47-metselwerk-baksteen, nen47-metselwerk-kunststeen, nen47-beton-gewapend, isolatie, none." },
+                "insulation":   { "type": "string", "description": "wall: insulation sub-material when material is isolatie (steenwol, glaswol, pir, eps, kooltherm, pur)." },
+                "openings":     { "type": "array", "description": "wall: the doors and windows in this run. Each: kind (door|window), widthMm (frame size, outside dimensions; in a single wall this is also the opening), alongMm (centre, measured from start along the wall), sillMm, heightMm, swing (left|right: the hinge side seen from the side the door opens away from), openSide (left|right of the wall direction) or openTo ({x, y}: a point in the room the door opens into; for a window its inside), windowType (fixed|turn|pivot|tilt), showSwing (window: true also draws the opening direction of a turn sash as a dashed quarter circle; default false, because in a plan it reads as a door). Frame, all optional: stileWidthMm (default 67), frameDepthMm (default 114, never deeper than the wall), framePositionMm (outside face of the wall to outside face of the frame; default: behind the outer leaf in a layered wall, centred in a single wall), overlapMm (outer leaf over the frame; default 20 in a layered wall), clearanceMm (reveal of the inner leaf; default 10 in a layered wall), leafThicknessMm (door leaf, default 40)." },
+                "minPierMm":    { "type": "number", "description": "wall: smallest piece of wall that must remain beside an opening (default 0)." },
+                "joinStart":    { "type": "boolean", "description": "wall: false = the start of the run never joins another wall: no mitre, no T, no trim; the end keeps a plain butt cap exactly where it is drawn (default true). Otherwise walls that touch are joined automatically: coincident end points are mitred; ends that just pass or fall short of a wall of the same material are trimmed to a closed corner; an end that stops on a continuing wall (on its centre line, on its face, just short of it or inside it) forms a T, where the same material flows into it and another material butts against its face with a seam. Later: app_update_annotation props noJoinStart / noJoinEnd." },
+                "joinEnd":      { "type": "boolean", "description": "wall: false = the end of the run never joins another wall (see joinStart; default true)." },
+                "layers":       { "type": "array", "description": "wall: build-up of a layered (cavity) wall, from outside to inside, each {thicknessMm, material, insulation}; material none is an air cavity (not drawn). The run's start/end are then the outside face, thicknessMm and material of the run are ignored. Answer: layers[i].wallIds per drawn layer, per opening frame and layerOpeningsMm, corners = layers mitred at start/end." },
+                "insideSide":   { "type": "string", "enum": ["left", "right"], "description": "wall with layers: which side of start->end is inside (default right; a clockwise outline has the inside on the right)." },
+                "wallId":       { "type": "string", "description": "dimensions: a single wall annotation to dimension." },
+                "wallIds":      { "type": "array", "description": "dimensions: the wall segments of one run, in order along the run (as returned by action \"wall\")." },
+                "offsetMm":     { "type": "number", "description": "dimensions: distance from the wall face to the chain, in mm (default 500 at 1:50; larger at smaller scales, so the text fits)." },
+                "totalOffsetMm": { "type": "number", "description": "dimensions: distance from the wall face to the overall dimension, in mm (default offsetMm plus one line of text, at least 350)." },
+                "showUnit":     { "type": "boolean", "description": "dimensions: also show the unit behind the number (default false: the number only, as on a building drawing)." },
+                "chainOf":      { "type": "string", "description": "dimensions: the id of a dimension (measureDistance) whose chain you want to extend or shorten, with addPoints and/or removePoints." },
+                "addPoints":    { "type": "array", "description": "dimensions with chainOf: points {x, y} in page points to add as extension lines, between or outside the existing ones." },
+                "removePoints": { "type": "array", "description": "dimensions with chainOf: points {x, y} near the extension lines to remove (the measured point or anywhere along the extension line)." },
+                "tolerance":    { "type": "number", "description": "dimensions with removePoints: how close (page points) a point must be to an extension line (default 6)." },
+                "side":         { "type": "string", "enum": ["left", "right"], "description": "dimensions: which side of the run the chain goes, seen along its direction (default right). For an outline drawn clockwise on the sheet, left is outside." },
+                "place":        { "type": "boolean", "description": "rooms: also put the rooms on the sheet instead of only reporting them." },
+                "refresh":      { "type": "boolean", "description": "rooms/dimensions: recompute what is already on the sheet from the walls as they are now." },
+                "seeds":        { "type": "array", "description": "rooms: points inside the rooms you want, each {x, y, name, number}; number is optional. Without seeds every room found is reported." },
+                "names":        { "type": "array", "description": "rooms: set the name and/or number of placed rooms, each {id (the room area) or x, y (a point inside), name, number}." },
+                "maxOpeningMm": { "type": "number", "description": "rooms/inspect: widest gap between two aligned wall ends that still counts as an opening rather than a hole in the contour (default 3000)." }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// Het definitie-object van een systeemtype (#567), schema 1. Een eigen functie
+/// vanwege de recursielimiet van `json!` (zie lib.rs). `register`: bij
+/// registreren zijn naam, categorie en layout verplicht; bij bijwerken is niets
+/// verplicht en wist null een optioneel veld. De JS-kant
+/// (js/annotations/systeem-typen-contract.js) is de echte controle: Rust
+/// valideert het inputSchema niet.
+fn system_type_definition_schema(register: bool) -> Value {
+    let mut schema = json!({
+        "type": "object",
+        "properties": {
+            "naam":              { "type": "string", "description": "Display name (1-200 characters). Not an identity: references use the id." },
+            "categorie":         { "type": "string", "enum": ["plafond", "vloer", "wand", "overig"] },
+            "layout":            { "type": "string", "enum": ["raster", "strook"], "description": "raster: cells in two directions (needs celXMm and celYMm). strook: strips in one direction (needs strookBreedteMm and celYMm)." },
+            "ifcCategory":       { "type": "string", "enum": ["IfcCovering", "IfcWall", "IfcSlab", "IfcPlate"] },
+            "ifcPredefinedType": { "type": ["string", "null"], "enum": ["CEILING", "FLOORING", "FLOOR", "CLADDING", "ROOFING", null] },
+            "celXMm":            { "type": ["number", "null"], "minimum": 50, "maximum": 20000, "description": "Cell width in mm. Left out or null: unconfirmed, no default is applied." },
+            "celYMm":            { "type": ["number", "null"], "minimum": 50, "maximum": 20000, "description": "Cell height in mm. Left out or null: unconfirmed, no default is applied." },
+            "strookBreedteMm":   { "type": ["number", "null"], "minimum": 50, "maximum": 20000, "description": "Strip width in mm for the strook layout. Left out or null: unconfirmed." },
+            "edgeProfiel":       { "type": "string", "enum": ["geen", "hoeklijn", "schaduwvoeg"] },
+            "sparingRegels":     { "type": ["object", "null"], "properties": {
+                                     "kleineSparingMaxMm": { "type": "number", "minimum": 10, "maximum": 20000 },
+                                     "raveelVanafMm":      { "type": "number", "minimum": 10, "maximum": 20000 } },
+                                   "additionalProperties": false },
+            "paneelTypen":       { "type": "array", "minItems": 1, "maxItems": 50, "items": {
+                                     "type": "object",
+                                     "properties": {
+                                       "id":          { "type": "string" },
+                                       "naam":        { "type": "string" },
+                                       "renderStijl": { "type": "string", "enum": ["tegel", "ventilatie", "licht"] } },
+                                     "required": ["id", "naam", "renderStijl"],
+                                     "additionalProperties": false } },
+            "lagen":             { "type": "array", "maxItems": 0, "description": "Reserved. Schema 1 has one implicit layer; only an empty array is accepted." }
+        },
+        "additionalProperties": false
+    });
+    if register {
+        schema["required"] = json!(["naam", "categorie", "layout"]);
+    }
+    schema
+}
+
+/// `app_read_ui` (#584): de interface als compacte toegankelijkheidsboom
+/// lezen (rol, naam, staat), zodat een agent kan nalezen wat een klik deed.
+/// De regels staan in js/core/mcp-ui-boom.js.
+fn read_ui_tool() -> Value {
+    json!({
+        "name": "app_read_ui",
+        "description": "Read the LIVE app's interface as a compact accessibility-style tree, to check what a click did without a screenshot. Each node has a role (button, tab, tabpanel, group, combobox, option, checkbox, status, text, ...), a name and only the state that applies: disabled, checked, pressed, selected, expanded, active, focused, readonly, plus value/valueText for inputs. Ribbon tabs carry `tab` and the `command` 'ribbon-tab:<tab>'; ribbon buttons and extension controls carry the `command` that app_run_command runs. Without `selector` it reads the ribbon (only the active tab's content exists), the side panels, the bars above the document, floating palettes, open dialogs and the status bar, each as a region. With `selector` it reads the matching elements instead, for example an extension's panel. Reads only: it never switches ribbon tabs. maxDepth, maxNodes and maxText keep the output small; `truncated` says when something was left out.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "selector":      { "type": "string", "description": "CSS selector of the element(s) to read, e.g. '.ribbon-container', '#left-panel' or '.status-bar'. Default: the standard regions." },
+                "maxDepth":      { "type": "integer", "minimum": 1, "maximum": 40, "default": 12, "description": "Maximum depth of the tree." },
+                "maxNodes":      { "type": "integer", "minimum": 1, "maximum": 3000, "default": 400, "description": "Maximum number of nodes over all regions together." },
+                "maxText":       { "type": "integer", "minimum": 8, "maximum": 1000, "default": 80, "description": "Maximum length of a name, description or value." },
+                "includeHidden": { "type": "boolean", "default": false, "description": "Also list hidden elements, marked with state.hidden." }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+/// `app_list_system_types` (#567): de bibliotheek met systeemtypen lezen.
+fn list_system_types_tool() -> Value {
+    json!({
+        "name": "app_list_system_types",
+        "description": "List the reusable system types (suspended ceilings, floor slabs, panel systems) of the app library, or one type by id. Each entry has its stable id, owner, revision, whether the user edited it, the validated definition, unconfirmed dimensions and stored values that fail validation. Compare libraryRevision between calls to detect changes. Reads only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Stable id of one system type." }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+/// `app_register_system_type` (#567): een type onder `mcp:<key>` registreren.
+/// Een andere definitie vervangt een bestaand, onbewerkt `mcp:`-type en
+/// hertekent alle systemen ermee: daarom `wijzigt` in mcp_tool_meta.rs.
+fn register_system_type_tool() -> Value {
+    json!({
+        "name": "app_register_system_type",
+        "description": "Register a system type owned by MCP under the id mcp:<key>. Repeating the call with the same definition changes nothing (status unchanged), and a definition the user edited in the app is kept (status kept-user-edit) and never overwritten. A different definition replaces an existing mcp:<key> type that the user has not edited (status updated) and redraws every system that uses it. Unknown fields, out-of-range values and layered definitions are rejected. Missing dimensions stay unconfirmed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "key":        { "type": "string", "description": "Stable key: lowercase letters, digits, dot, underscore or hyphen (1-64)." },
+                "definition": system_type_definition_schema(true),
+                "schema":     { "type": "integer", "enum": [1] },
+                "restore":    { "type": "boolean", "description": "Recreate a type the user removed. Only on an explicit user request." }
+            },
+            "required": ["key", "definition"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// `app_update_system_type` (#567): een MCP-type bijwerken met revisiecontrole.
+fn update_system_type_tool() -> Value {
+    json!({
+        "name": "app_update_system_type",
+        "description": "Update a system type owned by MCP (id mcp:<key>). Pass the revision you last read as expectedRevision; a stale revision is rejected with the current revision. Types of the app or of extensions cannot be changed here. Nested values (sparingRegels, paneelTypen) are replaced as a whole; null clears an optional field.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id":               { "type": "string" },
+                "expectedRevision": { "type": "integer", "minimum": 1 },
+                "changes":          system_type_definition_schema(false),
+                "schema":           { "type": "integer", "enum": [1] }
+            },
+            "required": ["id", "expectedRevision", "changes"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// `app_open_system_type_editor` (#567): de native editor openen met de focus
+/// op een type. Keert meteen terug; de gebruiker past toe of annuleert.
+fn open_system_type_editor_tool() -> Value {
+    json!({
+        "name": "app_open_system_type_editor",
+        "description": "Open the app's system type editor with the given type selected, or select it in the editor that is already open without discarding unapplied edits. Returns immediately; the user applies or cancels in the app. Does not change any data.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Stable id of the system type to select." }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// `app_get_system_geometry` (#567, punt 7): de documentgebonden geometrie van
+/// één systeem in het actieve document, uit de eigen geometrie van de app.
+fn get_system_geometry_tool() -> Value {
+    json!({
+        "name": "app_get_system_geometry",
+        "description": "Get the geometry of one system (suspended ceiling, floor slab, panel field) in the active document, computed by the app's own geometry engine: panels with clipped outlines, grid lines, openings, trimmers, edge segments and component positions, in millimetres in the system's own frame (independent of zoom and view rotation; placement maps it onto the page). Includes the document and type revisions and whether every physical dimension is confirmed. Pass expectedDocumentRevision and expectedTypeRevision to reject a stale snapshot. Reads only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "annotationId":             { "type": "string", "description": "Id of the system annotation (type systeemraster) in the active document." },
+                "expectedDocumentRevision": { "type": "string", "description": "document.revision of an earlier snapshot; a different current revision is rejected." },
+                "expectedTypeRevision":     { "type": "integer", "minimum": 1, "description": "type.revision of an earlier snapshot; a different current revision is rejected." },
+                "schema":                   { "type": "integer", "enum": [1] }
+            },
+            "required": ["annotationId"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// `app_call_extension_command` (#575): een gestructureerde opdracht van een
+/// geladen extensie aanroepen. Elke opdracht staat ook als eigen tool
+/// (`ext_<extensie>__<opdracht>`) in tools/list; deze vaste tool is er voor
+/// een client die zijn lijst las voordat de extensie geladen was.
+fn call_extension_command_tool() -> Value {
+    json!({
+        "name": "app_call_extension_command",
+        "description": "Run a structured command of a loaded extension. Every such command is also listed as its own tool named ext_<extension>__<command>; use this tool when that tool is not in your list, for example after installing or reloading an extension. app_list_extensions with includeContributions lists each command with its input and output schema. The arguments are checked against the input schema before the extension runs; a mutating command also needs idempotencyKey and revisionContext. Returns ok, requestId, extension, command and result, or ok: false with an error code such as UNKNOWN_COMMAND, INVALID_ARGUMENT, STALE_REVISION, IDEMPOTENCY_KEY_REUSED, COMMAND_TIMEOUT or EXTENSION_UNLOADED.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool":      { "type": "string", "description": "Tool name of the extension command, ext_<extension>__<command>." },
+                "arguments": { "type": "object", "description": "Arguments for the command, as described by its input schema.", "additionalProperties": true }
+            },
+            "required": ["tool"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// Beschrijving van `app_facade_element`: het gevelelement (#475) — een
+/// vliesgevel of kozijn als één object met stijlen op de veldgrenzen en een
+/// paneel per veld.
+fn facade_element_tool() -> Value {
+    json!({
+        "name": "app_facade_element",
+        "description": "Draw and edit a facade element in a floor plan: a curtain wall or a window frame, as ONE object along a line with an outer frame, mullions on the field boundaries and a panel in every field. Everything is at real size (mm) from the measurement scale, so set one first with app_set_measure_scale. Actions: \"create\" places a new element, either loose along start/end (page points), or IN an existing wall (wallId plus fromMm or alongMm and lengthMm): the wall is then cut over the length of the element, like a door or window opening, and the element sits in the gap; offsetMm moves it across the wall build-up (+ = right of the wall direction). The division is fields (number of equal fields, centre-to-centre) or fieldWidthsMm (centre-to-centre widths that add up to the length); without either it divides itself into fields of about 1200 mm (curtain wall) or 900 mm (window frame). \"get\" returns one element (id) with its mullions and fields, or without id a summary of every element on the page. Edits (all need id): \"addMullion\" splits a field at atMm (from the start) or in the middle of field; \"removeMullion\" merges the two fields beside mullion (index) or the mullion nearest atMm; \"moveMullion\" moves it to toMm or by byMm; \"setMullionType\" swaps the type of mullion (index 0 and the last index are the outer frame; without mullion or atMm all intermediate mullions); \"setPanel\" swaps the panel of field, fieldIndexes or the field at atMm; \"divide\" divides again into fields or fieldWidthsMm. Mullions are numbered from 0 (frame at the start) to n (frame at the end); field i lies between mullion i and i+1. Fields never become narrower than 100 mm clear and the overall length stays the same, except for divide with fieldWidthsMm. Mullion types: curtain wall alu-50x150 (default), alu-50x200, alu-65x250; window frame hout-67x114 (default), hout-67x139, hout-90x114 (width x depth in mm). Panels: curtain wall glass, solid, door, open; window frame glass, turnSash, door, solid. A panel is a name or {type, hinge: start|end, swing: inside|outside} for a door or turn sash. Every call is a single undo step and returns the element as it is now.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action":        { "type": "string", "enum": ["create", "get", "addMullion", "removeMullion", "moveMullion", "setMullionType", "setPanel", "divide"], "description": "What to do." },
+                "page":          { "type": "number", "description": "1-based page (default: the current page)." },
+                "id":            { "type": "string", "description": "The facade element to read or edit (as returned by create or get)." },
+                "preset":        { "type": "string", "enum": ["curtainWall", "windowFrame"], "description": "create: which kind of element (default curtainWall)." },
+                "start":         { "type": "object", "description": "create (loose): start of the element as {x, y} in page points.", "additionalProperties": true },
+                "end":           { "type": "object", "description": "create (loose): end of the element as {x, y} in page points.", "additionalProperties": true },
+                "wallId":        { "type": "string", "description": "create: put the element in this wall annotation; the wall is cut over the element's length." },
+                "fromMm":        { "type": "number", "description": "create in a wall: distance from the wall start to the START of the element, in mm." },
+                "alongMm":       { "type": "number", "description": "create in a wall: distance from the wall start to the MIDDLE of the element, in mm (alternative to fromMm; without both the element is centred)." },
+                "lengthMm":      { "type": "number", "description": "create in a wall: length of the element = width of the gap, in mm (or give fieldWidthsMm)." },
+                "offsetMm":      { "type": "number", "description": "create in a wall: position across the wall build-up, mm from the wall centre line, + = right of the wall direction (default 0)." },
+                "fields":        { "type": "number", "description": "create/divide: number of equal fields." },
+                "fieldWidthsMm": { "type": "array", "description": "create/divide: centre-to-centre field widths in mm, from the start.", "items": { "type": "number" } },
+                "mullionType":   { "type": "string", "description": "create/addMullion/setMullionType: mullion type id, e.g. alu-50x150 or hout-67x114." },
+                "frameType":     { "type": "string", "description": "create: type of the outer frame (both ends)." },
+                "panels":        { "type": "array", "description": "create: the panel of each field, from the start (a name or {type, hinge, swing})." },
+                "panel":         { "type": ["string", "object"], "description": "create: panel for every field not given in panels; setPanel: the new panel. A name (glass, solid, door, open, turnSash) or {type, hinge: start|end, swing: inside|outside}; an object without type only changes hinge/swing." },
+                "insideSide":    { "type": "string", "enum": ["right", "left"], "description": "create: which side of the drawing direction is inside (doors swing inside by default; default right)." },
+                "mullion":       { "type": "number", "description": "removeMullion/moveMullion/setMullionType: mullion index (0 = frame at the start)." },
+                "atMm":          { "type": "number", "description": "Position along the element from its start, in mm: where addMullion splits, which mullion (nearest) or field setPanel/removeMullion/moveMullion/setMullionType means." },
+                "toMm":          { "type": "number", "description": "moveMullion: new position from the start, in mm." },
+                "byMm":          { "type": "number", "description": "moveMullion: shift in mm (+ = towards the end)." },
+                "field":         { "type": "number", "description": "addMullion: split this field in the middle; setPanel: the field index (0 = at the start)." },
+                "fieldIndexes":  { "type": "array", "description": "setPanel: several field indexes at once.", "items": { "type": "number" } }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// Extensies beheren via MCP (#550): opvragen, installeren uit een lokaal
+/// `.oppx`-pakket en herladen, zonder dialoog en zonder herstart.
+fn extensie_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "app_list_extensions",
+            "description": "List the app's extensions: every installed and every loaded extension with its id, name, version, installed version, whether it is loaded and activated, its status (active, failed, notLoaded, busy), the code and message of the last failure, who made the last change (ui, mcp or startup) and whether it uses an old-style id. Broken folders in the extensions directory are listed under problems instead of being skipped. Reads only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "includeContributions": { "type": "boolean", "description": "Also list each extension's registered contributions (ribbon tabs, command count, annotation types, palettes, property panels, and structured commands with their input and output schemas). Default false." }
+                },
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "app_install_extension",
+            "description": "Install or update an extension from a local .oppx package, without a file dialog and without restarting the app: the package is checked and unpacked by the app, then the new version is activated. If the new version fails to load or activate, the previous working version is restored and stays active (rolledBack: true). Open PDF tabs and unsaved changes are not touched. Returns ok, outcome (installed, updated, unchanged), id, version, previousVersion, activated and the registered contributions, or ok: false with an error code such as PATH_NOT_ALLOWED, PACKAGE_INVALID, MANIFEST_INVALID, ALREADY_INSTALLED, VERSION_NOT_NEWER, MODULE_LOAD_FAILED or ACTIVATION_FAILED.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute path to a local .oppx package. Relative paths, network shares and URLs are refused." },
+                    "replace": { "type": "string", "enum": ["never", "ifNewer", "always"], "description": "What to do when the extension id is already installed: 'never' refuses, 'ifNewer' replaces only a lower version, 'always' replaces (also a downgrade). An identical package (same SHA-256) is always reported as 'unchanged'." },
+                    "idempotencyKey": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$", "description": "Caller-chosen key for this install request. Repeating a call with the same key, path and replace returns the stored result without installing again; the same key with a different path or replace is refused." }
+                },
+                "required": ["path", "replace", "idempotencyKey"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "app_reload_extension",
+            "description": "Reload an installed extension from disk: deactivate it, remove everything it registered (ribbon tabs, commands, annotation types, palettes, panels) and activate it again, without restarting the app. If the reloaded code fails, the previous code is activated again (rolledBack: true). Returns ok, outcome 'reloaded', id, version, activated and contributions, or ok: false with an error code such as NOT_INSTALLED, MODULE_LOAD_FAILED or ACTIVATION_FAILED.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Extension id from app_list_extensions." }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        }),
+    ]
+}
+
+/// Agenttaken van extensies (#556): een MCP-agent pakt een gestructureerde
+/// taak op en levert een gestructureerd resultaat, zonder chatbericht. De
+/// regels staan in js/plugins/agent-tasks.js.
+fn agent_task_pending_tool() -> Value {
+    json!({
+        "name": "app_agent_task_pending",
+        "description": "Take the oldest structured agent task that an extension submitted: the task moves from pending to running and no other client gets it. Returns { ok, task, waiting }; task is null when no task waits. A task has id, kind, extensionId, document { id, page, pageCount, sourceFingerprint, pageRotation, scale }, context (only the fields the extension chose to share), resultSchema (what the answer must match), createdAt, deadline (ms timestamps) and attemptsLeft. No conversation, file name or other tasks are shared. Answer with app_agent_task_result before the deadline; the task is cancelled when the user switches or closes the document, or when its source, page or scale changes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]{0,63}$", "description": "Only take a task of this kind, for example floorplan.recognize. Left out: the oldest task of any kind." }
+            },
+            "additionalProperties": false
+        }
+    })
+}
+
+/// Het antwoord op precies die ene taak: een resultaat dat aan het
+/// resultaatschema van de taak voldoet, of een fout.
+fn agent_task_result_tool() -> Value {
+    json!({
+        "name": "app_agent_task_result",
+        "description": "Answer a running agent task by its id (from app_agent_task_pending) with either result, an object that must match the task's resultSchema (unknown fields are refused), or error { message, code } when the task cannot be done. The answer goes only to the extension that submitted this task, as a proposal: nothing is drawn until the extension applies it to the same document. Returns { ok, id, status }. A result that does not match returns ok false, code INVALID_RESULT, errors and attemptsLeft: send a corrected result; after the last attempt the task fails. Other codes: UNKNOWN_TASK, TASK_NOT_CLAIMED, TASK_NOT_RUNNING (with status and reason, for a task that was cancelled, failed or answered already) and STALE_TASK (the document, source, page or scale changed; the task is cancelled).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Task id from app_agent_task_pending." },
+                "result": { "type": "object", "description": "The structured result; it must match the task's resultSchema." },
+                "error": {
+                    "type": "object",
+                    "description": "Instead of result: why the task cannot be done.",
+                    "properties": {
+                        "code": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,64}$", "description": "Optional machine-readable code." },
+                        "message": { "type": "string", "maxLength": 2000, "description": "What went wrong." }
+                    },
+                    "required": ["message"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// Paginabewerkingen, bladwijzers en watermerken (voorstel voor
+/// de Python-bibliotheek, #804). Elk gereedschap roept in de WebView dezelfde
+/// functie aan als het lint (js/pdf/mcp-paginabewerkingen.js,
+/// js/ui/panels/bladwijzers-mcp.js, js/watermark/watermerken-mcp.js). Ze staan
+/// in de lijst direct na `app_merge_pdf`.
+fn pagina_tools() -> Vec<Value> {
+    let paginas = |beschrijving: &str| json!({
+        "type": "array",
+        "items": { "type": "integer", "minimum": 1 },
+        "minItems": 1,
+        "description": beschrijving
+    });
+    vec![
+        json!({
+            "name": "app_rotate_pages",
+            "description": "Rotate pages of the active document by a quarter, half or three-quarter turn, as one undo step, the same way Organize > Rotate does: the markups on those pages and the measurement scales of the PDF turn along. Returns { ok, angle, pages, rotations: [{ page, rotation }] }, where rotation is the app's rotation on top of the page's own /Rotate; it is written into the file on save. Refused in a read-only document (PDF/A without editing enabled, password-protected).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pages": paginas("Page numbers (1-based) to rotate, each once."),
+                    "angle": { "type": "integer", "enum": [90, 180, 270, -90], "description": "Degrees clockwise; -90 turns counter-clockwise." }
+                },
+                "required": ["pages", "angle"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "app_delete_pages",
+            "description": "Delete pages from the active document, as one undo step, the same way Organize > Delete does: the markups on the deleted pages go with them, the others, the page labels and the measurement scales move along. A document keeps at least one page: deleting every page is refused. Returns { ok, deleted, pagesBefore, pagesAfter, currentPage }. Refused in a read-only document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pages": paginas("Page numbers (1-based) to delete, each once.")
+                },
+                "required": ["pages"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "app_insert_blank_pages",
+            "description": "Insert blank pages into the active document, as one undo step, the same way Organize > Insert does. Without widthPt and heightPt the new pages get the size of page `after` (the first page when after is 0). Returns { ok, inserted (the new page numbers), widthPt, heightPt, pagesBefore, pagesAfter, currentPage }. Refused in a read-only document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "after":    { "type": "integer", "minimum": 0, "description": "Insert after this page number; 0 inserts before the first page." },
+                    "count":    { "type": "integer", "minimum": 1, "maximum": 500, "default": 1, "description": "Number of blank pages." },
+                    "widthPt":  { "type": "number", "minimum": 3, "maximum": 14400, "description": "Page width in points (1/72 inch, A4 is 595.28 x 841.89). Give together with heightPt." },
+                    "heightPt": { "type": "number", "minimum": 3, "maximum": 14400, "description": "Page height in points. Give together with widthPt." }
+                },
+                "required": ["after"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "app_extract_pages",
+            "description": "Write pages of the active document, in the given order, to a new PDF file, the same way Organize > Extract does. An existing file is never replaced: choose a path that does not exist yet. With deleteFromOriginal the pages are then deleted from the document (one undo step); that is refused when it would remove every page. Returns { ok, outputPath, pages, pagesExtracted, deletedFromOriginal, pagesAfter }. Refused in a read-only document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pages":              paginas("Page numbers (1-based) to extract, each once, in the order they appear in the new file."),
+                    "outputPath":         { "type": "string", "description": "Absolute path of the new .pdf file; it must not exist yet." },
+                    "deleteFromOriginal": { "type": "boolean", "default": false, "description": "Also delete the extracted pages from the document." }
+                },
+                "required": ["pages", "outputPath"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "app_reorder_pages",
+            "description": "Put the pages of the active document in a new order, as one undo step, the same way dragging thumbnails does: markups, page labels and measurement scales move with their page. order[i] is the current page number that becomes page i+1, and lists every page exactly once (for 3 pages, [3, 1, 2] moves the last page to the front). Returns { ok, changed, order, pages, currentPage }; the current order gives changed false. Refused in a read-only document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "order": paginas("The new order: every current page number (1-based) exactly once.")
+                },
+                "required": ["order"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "app_shift_pages",
+            "description": "Shift the content of pages by a fixed distance, as one undo step, the same way Organize > Shift page does: the page content is moved (not rasterized), and the markups, links, form fields and measurement scales on those pages move along. Directions are as the page is displayed (including its rotation): dx positive to the right, dy positive up. Returns { ok, pages, dx, dy, shifted } with shifted the number of pages that moved; pages without content and markups are left alone. Refused in a read-only document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pages": paginas("Page numbers (1-based) to shift, each once."),
+                    "dx":    { "type": "number", "minimum": -5080, "maximum": 5080, "default": 0, "description": "Horizontal shift in millimetres; positive is to the right." },
+                    "dy":    { "type": "number", "minimum": -5080, "maximum": 5080, "default": 0, "description": "Vertical shift in millimetres; positive is up." }
+                },
+                "required": ["pages"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "app_bookmarks",
+            "description": "Read and edit the bookmarks (outline) of the active document, the same way the Bookmarks panel does; every change is one undo step and is written into the file on save. list returns { ok, count, bookmarks: [{ id, title, page, parentId, level, children, bold, italic, color }] } in panel order (a parent before its children). add takes title, optional page (default the current page), parentId, bold, italic and color, appends the bookmark at the end of its parent and returns { ok, bookmark }. update takes id and any of title (rename), page, bold, italic, color (null clears it). delete takes ids and removes them with everything under them: { ok, deleted, count, remaining }. move takes ids, position (before, after or inside targetId, or end of the top level without targetId) and refuses a move into a bookmark's own children. Edits are refused in a read-only document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action":   { "type": "string", "enum": ["list", "add", "update", "delete", "move"] },
+                    "id":       { "type": "string", "description": "update: the bookmark id (from list)." },
+                    "ids":      { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "delete, move: bookmark ids (from list)." },
+                    "title":    { "type": "string", "maxLength": 1000, "description": "add, update: the bookmark title (one line)." },
+                    "page":     { "type": "integer", "minimum": 1, "description": "add, update: the page the bookmark goes to (1-based)." },
+                    "parentId": { "type": ["string", "null"], "description": "add: put the new bookmark under this bookmark; left out or null: the top level." },
+                    "bold":     { "type": "boolean", "description": "add, update: bold title." },
+                    "italic":   { "type": "boolean", "description": "add, update: italic title." },
+                    "color":    { "type": ["string", "null"], "pattern": "^#[0-9A-Fa-f]{6}$", "description": "add, update: title colour #rrggbb; null clears it." },
+                    "targetId": { "type": "string", "description": "move: the bookmark to move before, after or inside. Not with position end." },
+                    "position": { "type": "string", "enum": ["before", "after", "inside", "end"], "description": "move: before or after targetId (same parent), inside targetId (as its last children), or end of the top level." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "app_watermarks",
+            "description": "List, add and remove the watermarks and headers/footers of the active document, the same way the Watermark, Header & Footer and Manage dialogs do; every change is one undo step, shown at once and written into the pages on save. list returns { ok, count, watermarks } (an image watermark without its image data). add with type text (text, fontFamily, fontSize, color, opacity 0-1, rotation, position, customX/customY, layer), image (imagePath of a PNG or JPEG file, opacity, scale, rotation, position, customX/customY, layer) or headerFooter (headerLeft/Center/Right, footerLeft/Center/Right with the variables {page} {pages} {date} {time} {filename} {title} {bates}, fontFamily, fontSize, color, margins, Bates numbering); pages limits it to those pages, otherwise every page. Fields left out take the dialog defaults. Returns { ok, watermark, count }. remove takes id: { ok, removed, remaining }. Changes are refused in a read-only document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action":       { "type": "string", "enum": ["list", "add", "remove"] },
+                    "id":           { "type": "string", "description": "remove: the watermark id (from list)." },
+                    "type":         { "type": "string", "enum": ["text", "image", "headerFooter"], "description": "add: what to add." },
+                    "pages":        paginas("add: only on these page numbers (1-based); left out: every page."),
+                    "text":         { "type": "string", "maxLength": 500, "description": "text: the watermark text." },
+                    "imagePath":    { "type": "string", "description": "image: absolute path of a .png, .jpg or .jpeg file (at most 20 MB)." },
+                    "fontFamily":   { "type": "string", "enum": ["Helvetica", "Arial", "Times New Roman", "Courier", "Georgia"], "description": "text, headerFooter (not Georgia): font. Default Helvetica." },
+                    "fontSize":     { "type": "integer", "minimum": 1, "maximum": 288, "description": "text (4-288, default 72), headerFooter (1-200, default 10): font size in points." },
+                    "color":        { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$", "description": "text (default #ff0000), headerFooter (default #000000): colour #rrggbb." },
+                    "opacity":      { "type": "number", "minimum": 0, "maximum": 1, "description": "text (default 0.3), image (default 0.2)." },
+                    "rotation":     { "type": "number", "minimum": -360, "maximum": 360, "description": "text (default -45), image (default 0): degrees." },
+                    "scale":        { "type": "number", "minimum": 0.01, "maximum": 10, "description": "image: size factor of the 200 x 200 pt image box (default 1)." },
+                    "position":     { "type": "string", "enum": ["center", "top-left", "top-right", "bottom-left", "bottom-right", "custom"], "description": "text, image: where on the page (default center); custom uses customX/customY." },
+                    "customX":      { "type": "number", "minimum": 0, "maximum": 14400, "description": "text, image with position custom: centre x in points from the left." },
+                    "customY":      { "type": "number", "minimum": 0, "maximum": 14400, "description": "text, image with position custom: centre y in points from the top." },
+                    "layer":        { "type": "string", "enum": ["behind", "infront"], "description": "text, image: behind (default) or in front of the page content." },
+                    "headerLeft":   { "type": "string", "maxLength": 500 },
+                    "headerCenter": { "type": "string", "maxLength": 500 },
+                    "headerRight":  { "type": "string", "maxLength": 500 },
+                    "footerLeft":   { "type": "string", "maxLength": 500 },
+                    "footerCenter": { "type": "string", "maxLength": 500 },
+                    "footerRight":  { "type": "string", "maxLength": 500 },
+                    "marginTop":    { "type": "number", "minimum": 0, "maximum": 1000, "description": "headerFooter: points (default 30)." },
+                    "marginBottom": { "type": "number", "minimum": 0, "maximum": 1000, "description": "headerFooter: points (default 30)." },
+                    "marginLeft":   { "type": "number", "minimum": 0, "maximum": 1000, "description": "headerFooter: points (default 40)." },
+                    "marginRight":  { "type": "number", "minimum": 0, "maximum": 1000, "description": "headerFooter: points (default 40)." },
+                    "batesPrefix":  { "type": "string", "maxLength": 500, "description": "headerFooter: text before the Bates number." },
+                    "batesStart":   { "type": "integer", "minimum": 0, "description": "headerFooter: first Bates number (default 1)." },
+                    "batesDigits":  { "type": "integer", "minimum": 1, "maximum": 12, "description": "headerFooter: digits with leading zeros (default 6)." },
+                    "batesSuffix":  { "type": "string", "maxLength": 500, "description": "headerFooter: text after the Bates number." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }),
+    ]
+}
+
+/// Handle `tools/list`. Tasks 7-9 will append their tool descriptors to
+/// this array.
+fn handle_tools_list() -> Value {
+    let mut lijst = json!({
+        "tools": [
+            {
+                "name": "list_test_pdfs",
+                "description": "List all PDFs in the test corpus directory.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "screenshot_page",
+                "description": "Render a single PDF page to PNG (returned as base64).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path":       { "type": "string" },
+                        "page_index": { "type": "integer", "minimum": 0 },
+                        "width":      { "type": "integer", "minimum": 1, "default": 2000 }
+                    },
+                    "required": ["path", "page_index"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "get_pdf_metadata",
+                "description": "Read PDF version, producer, and per-page metadata.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "screenshot_all",
+                "description": "Render all pages of a PDF as base64 PNGs. For batch rendering; clients with size constraints should call screenshot_page per page instead.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path":  { "type": "string" },
+                        "width": { "type": "integer", "minimum": 1, "default": 2000 }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_open_pdf",
+                "description": "Open a PDF file in a new tab of the running app. Returns once the document is loaded and the tab is active. A DWG or DXF opens the CAD import dialog instead (result `dialog: \"cad-import\"`). A PDF with an open password shows the password dialog instead (result `dialog: \"pdf-password\"`); it opens read-only once the password is entered in the app.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_set_zoom",
+                "description": "Set the page-view zoom in the LIVE app. scale=1.0 means 100%, 2.0 means 200%, etc.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scale": { "type": "number", "minimum": 0.05, "maximum": 32.0 }
+                    },
+                    "required": ["scale"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_zoom_in",
+                "description": "Trigger one zoom-in step in the LIVE app (same as the toolbar +).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_zoom_out",
+                "description": "Trigger one zoom-out step in the LIVE app (same as the toolbar -).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_screenshot_view",
+                "description": "Capture the LIVE app as a base64 PNG. scope 'document' (default) composites the PDF canvas with the annotation/highlight overlays, without the surrounding interface. scope 'window' captures the whole app window as it is shown: ribbon (including extension tabs), side panels such as an extension's workspace panel, the document view and the status bar. scope 'element' crops that window capture to the element matched by `selector`. The longer side is scaled down to `width`. Returns { png_base64, width, height, scope, bounds: { x, y, width, height } (the captured area in CSS px), devicePixelRatio }. 'window' and 'element' use a native capture of the web view and are available on Windows only for now; on other platforms they return an error.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "width":    { "type": "integer", "minimum": 1, "default": 2000, "description": "Maximum length in px of the longer side of the PNG." },
+                        "scope":    { "type": "string", "enum": ["document", "window", "element"], "default": "document", "description": "'document' (the page view), 'window' (the whole app window) or 'element' (one element, needs selector)." },
+                        "selector": { "type": "string", "description": "CSS selector of the element to capture with scope 'element', e.g. '.ribbon-container', '#left-panel' or '.status-bar'." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_capture_region",
+                "description": "Render an area of a page (or the whole page) of the active document as an image at a chosen resolution, the way Home > Screenshot does: the page is rendered again at `dpi` (not the screen pixels enlarged), with the annotations as printed (no selection frames), in the view rotation the user sees. Coordinates are app points (page space, top-left origin, 100% zoom); leave x, y, width and height out for the whole page. Very large images are scaled down to at most 16384 px per side and 64 megapixels (`limited` is then true and `dpi` the resolution used). Returns { page, rect, width, height, dpi, limited, mime } plus image_base64, or with `path` the image is written to that file and { path, bytes } is returned instead of the base64. Nothing is put on the clipboard.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "page":    { "type": "integer", "minimum": 1, "description": "Page number (default: the current page)." },
+                        "x":       { "type": "number", "description": "Left edge in app points." },
+                        "y":       { "type": "number", "description": "Top edge in app points." },
+                        "width":   { "type": "number", "description": "Width in app points." },
+                        "height":  { "type": "number", "description": "Height in app points." },
+                        "dpi":     { "type": "number", "minimum": 10, "maximum": 2400, "default": 150, "description": "Resolution in pixels per inch of paper." },
+                        "format":  { "type": "string", "enum": ["png", "jpeg"], "default": "png" },
+                        "quality": { "type": "integer", "minimum": 1, "maximum": 100, "default": 90, "description": "JPEG quality." },
+                        "path":    { "type": "string", "description": "Absolute file path to write the image to, instead of returning it as base64." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_mouse_move",
+                "description": "Dispatch a synthetic mousemove at viewport CSS coordinates (x, y) inside the LIVE WebView. Returns the element under the cursor.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "integer" },
+                        "y": { "type": "integer" }
+                    },
+                    "required": ["x", "y"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_mouse_click",
+                "description": "Dispatch a synthetic mouse click at (x, y). Sequence: mousemove -> mousedown -> mouseup -> click (or contextmenu for right). button: 'left' (default) | 'middle' | 'right'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "x":      { "type": "integer" },
+                        "y":      { "type": "integer" },
+                        "button": { "type": "string", "enum": ["left", "middle", "right"], "default": "left" }
+                    },
+                    "required": ["x", "y"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_mouse_drag",
+                "description": "Dispatch a synthetic drag from (x1,y1) to (x2,y2) using `steps` interpolated mousemove events. Sequence: mousedown(x1,y1) -> N x mousemove -> mouseup(x2,y2). button: 'left' (default) | 'middle' | 'right'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "x1":     { "type": "integer" },
+                        "y1":     { "type": "integer" },
+                        "x2":     { "type": "integer" },
+                        "y2":     { "type": "integer" },
+                        "button": { "type": "string", "enum": ["left", "middle", "right"], "default": "left" },
+                        "steps":  { "type": "integer", "minimum": 1, "maximum": 200, "default": 10 }
+                    },
+                    "required": ["x1", "y1", "x2", "y2"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_scroll",
+                "description": "Dispatch a synthetic wheel event at (x, y) with delta (dx, dy) in CSS pixels. Set ctrlKey=true to test ctrl+wheel zoom-to-cursor.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "x":       { "type": "integer" },
+                        "y":       { "type": "integer" },
+                        "dx":      { "type": "integer", "default": 0 },
+                        "dy":      { "type": "integer", "default": 0 },
+                        "ctrlKey": { "type": "boolean", "default": false },
+                        "shiftKey":{ "type": "boolean", "default": false },
+                        "altKey":  { "type": "boolean", "default": false },
+                        "metaKey": { "type": "boolean", "default": false }
+                    },
+                    "required": ["x", "y"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_key",
+                "description": "Press a single key (with optional modifiers) on the focused element. Dispatches keydown then keyup. e.g. {key:'Escape'} or {key:'z', ctrl:true} for undo.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "key":   { "type": "string" },
+                        "ctrl":  { "type": "boolean", "default": false },
+                        "shift": { "type": "boolean", "default": false },
+                        "alt":   { "type": "boolean", "default": false },
+                        "meta":  { "type": "boolean", "default": false }
+                    },
+                    "required": ["key"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_type",
+                "description": "Type a string into the focused element. For each character: keydown -> beforeinput -> (value splice) -> input -> keyup. Editable inputs receive value updates; non-editable elements receive only the key events.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string" }
+                    },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_get_viewport_state",
+                "description": "Probe the LIVE viewport state: render engine + timing chip, active document scale/page/viewMode, pdf-viewport singleton transform, pdf-canvas backing-store + CSS rect, high-zoom tile-overlay state (visible/hidden + position+size), pdf-container CSS rect + scroll offsets, and devicePixelRatio. Use this for any case where screen↔world coordinate mapping or zoom-state needs to be validated externally — e.g. after dispatching a zoom or scroll via `app_scroll`/`app_set_zoom`, call this to see where things landed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_get_recent_console",
+                "description": "Return the most recent matching console messages captured by the in-app observability buffer (mcp-bridge.js). Captures lines matching: [render], [tile], [wheel-zoom], [PERF], [pre-render], STALE, JANK. Buffer holds up to 500 entries; oldest auto-evicted. Filter with `since` (epoch-ms cutoff) or `tail` (last N entries) to limit output volume. Use after dispatching a zoom/scroll action to see exactly which render path fired, in what order, and whether any stale-render bailouts triggered.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "since": { "type": "number", "description": "Only return entries with timestamp >= this epoch-ms. Omit or 0 for all entries." },
+                        "tail":  { "type": "integer", "minimum": 1, "description": "Return only the last N matching entries. Omit for all." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_wheel_zoom",
+                "description": "Dispatch a synthetic ctrl+WheelEvent at (x, y) in the LIVE WebView — exercises the exact same wheel listener the OS hits, so this is a faithful proxy for a user spinning the wheel. `deltaY` < 0 = zoom in, > 0 = zoom out. Use this from an AI-driven debugging loop to reproduce the user's reported zoom problems WITHOUT a human at the mouse.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "number", "description": "Cursor clientX in CSS pixels (viewport-relative)." },
+                        "y": { "type": "number", "description": "Cursor clientY in CSS pixels (viewport-relative)." },
+                        "deltaY": { "type": "number", "description": "WheelEvent.deltaY. Default -120 (one notch zoom-in)." },
+                        "ctrlKey": { "type": "boolean", "description": "Whether ctrlKey is set (default true → zoom). Set false to test plain wheel pan/scroll." }
+                    },
+                    "required": ["x", "y"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_zoom_anchor_test",
+                "description": "Full cursor-anchor accuracy probe: snapshot pre-zoom canvas+container+tile state at (x, y), dispatch a synthetic ctrl+wheel event, WAIT for renderPage to fully settle (window.__pdfRenderInFlight === 0 + 2 RAFs + 1 setTimeout to drain post-paint tile overlay), then snapshot post-zoom state and compute `anchorErrorPx` — the displacement (in CSS pixels) between where the cursor's world-point WAS before the zoom and where it ENDED UP after. < 3 px = pass (imperceptible), < 8 = acceptable, > 8 = visible spring/drift. This is the AI's primary metric for verifying zoom-anchor fixes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "number", "description": "Cursor clientX in CSS pixels." },
+                        "y": { "type": "number", "description": "Cursor clientY in CSS pixels." },
+                        "direction": { "type": "string", "enum": ["in", "out"], "description": "Zoom direction. Default `in`." }
+                    },
+                    "required": ["x", "y"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_clear_caches",
+                "description": "Force-clear all PDF-related caches: Rust pdfium doc cache, Rust pixmap cache, JS-side ImageBitmap cache. Use to rule out cache-staleness as a cause of any reported zoom/render anomaly. Safe to call any time; the next renderPage will rebuild whatever it needs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_go_to_page",
+                "description": "Navigate the active document to a 1-based page number, exactly as if the user picked the page in the page box or clicked its thumbnail.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "page": { "type": "integer", "minimum": 1, "description": "1-based target page number." }
+                    },
+                    "required": ["page"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_set_tool",
+                "description": "Switch the LIVE app's active tool, exactly like clicking the ribbon button. Accepts any registered tool name, e.g. select, hand, line, arrow, draw, box, circle, polyline, spline, arc, filledArea, textbox, callout, comment, stamp, highlight, editText, measureDistance, measureArea, measurePerimeter, measureAngle, scaleRegion, trim, extend. Returns the tool that is actually active afterwards (PDF/A read-only mode can refuse the switch).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "tool": { "type": "string", "description": "Registered tool name." }
+                    },
+                    "required": ["tool"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_click_element",
+                "description": "Click an arbitrary DOM element in the LIVE app by CSS selector (usually '#button-id'). If the element lives on an inactive ribbon tab, the matching tab is activated first (the ribbon only renders the active tab's content). Returns { ok, found, disabled, clicked, activatedTab, activeTab }: activatedTab is the ribbon tab this call activated (the tab the search opened, the tab whose button was clicked, also an extension tab, or the tab the click switched to), activeTab the ribbon tab active afterwards. Disabled elements are reported but NOT clicked. Set searchTabs=false to probe only the current DOM (e.g. for dialogs) without touching the ribbon tabs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "selector":   { "type": "string", "description": "CSS selector of the element to click, e.g. '#dr-line'." },
+                        "searchTabs": { "type": "boolean", "default": true, "description": "Walk the ribbon tabs when the selector is not in the current DOM." }
+                    },
+                    "required": ["selector"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_ui_state",
+                "description": "Probe the UI state of a DOM element by CSS selector: { found, visible, disabled, active ('active' class or aria-pressed), text, tag, activatedTab }. Uses the same ribbon-tab search as app_click_element; set searchTabs=false to probe only the current DOM (e.g. '.modal-dialog' while a dialog is open).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "selector":   { "type": "string", "description": "CSS selector of the element to inspect." },
+                        "searchTabs": { "type": "boolean", "default": true, "description": "Walk the ribbon tabs when the selector is not in the current DOM." }
+                    },
+                    "required": ["selector"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_set_window_size",
+                "description": "Resize the LIVE app window to a logical width x height. Protocol runs call this up-front so fit-scale, white-margin and ribbon-overflow behaviour are deterministic regardless of the size the window opened with.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "width":  { "type": "number", "minimum": 200, "description": "Logical window width in px." },
+                        "height": { "type": "number", "minimum": 200, "description": "Logical window height in px." }
+                    },
+                    "required": ["width", "height"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_get_current_tool",
+                "description": "Return the LIVE app's currently active tool name (state.currentTool).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_merge_pdf",
+                "description": "Merge one or more PDF files into the active document at the given position. The user's original file is not modified; the merged result opens as a working copy until saved. Returns { ok, position, mergedFiles, pagesInserted, pagesBefore, pagesAfter, filePath }; mergedFiles counts the files that really went in. A file that stays out makes ok false: a preview PDF of the CAD import is refused (reason preview-pdf), a file without pages is refused (no-pages), an unreadable file fails. Then error names the files, refused [{ file, reason }] and failed [{ file, error }] list them, and mergedFiles and pagesAfter show what did go in.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "filePaths": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Absolute paths of PDF files to merge into the current document." },
+                        "position": { "type": "string", "enum": ["end", "start", "after"], "description": "Where to insert the merged pages: 'end' (default), 'start', or 'after' the current page." }
+                    },
+                    "required": ["filePaths"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_accounts_status",
+                "description": "Report the LIVE app's OpenAEC sign-in state: { ok, signedIn, user:{sub,name,email}|null, brand|null }. Use to verify login from outside the WebView.",
+                "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+            },
+            {
+                "name": "app_accounts_fetch",
+                "description": "Make an authenticated OpenAEC Accounts API call from the LIVE signed-in app (GET/POST/DELETE to /me/* paths, e.g. /me/apps, /me/files, /me/brand, /me/storage, /me/credits). Returns { ok, response }. Requires sign-in. Makes the whole Accounts API drivable/testable via MCP.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path":   { "type": "string", "description": "API path, e.g. /me/apps" },
+                        "method": { "type": "string", "enum": ["GET", "POST", "DELETE"], "description": "HTTP method (default GET)" },
+                        "body":   { "type": "object", "description": "Optional JSON body for POST." }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            },
+            // Agenttaken van extensies (#556)
+            agent_task_pending_tool(),
+            agent_task_result_tool(),
+            {
+                "name": "app_create_annotation",
+                "description": "Create an annotation on the LIVE app's active document WITHOUT synthetic mouse input. Builds the same object the interactive tool would, pushes it onto the document, records an undo step and redraws. Geometry goes in `props` (page coordinates at 100% zoom): line/arrow/measureDistance need startX/startY/endX/endY; box/circle/highlight/cloud/textbox/callout/scaleRegion need x/y/width/height (highlight is an area highlight; optional rotation in degrees turns it about its centre); textHighlight is a real text highlight and needs quads:[[ul,ur,ll,lr],...], one quad per piece of text with {x,y} corners in the order upper left, upper right, lower left, lower right, turned along angled text (the same object as a text highlight made by selecting text; default color #FFFF00, opacity 0.3; its box comes from the quads, a passed x/y/width/height is ignored; invalid quads give an error and create nothing); polygon takes its corners as points:[{x,y},...] (>= 3), or x/y/width/height (+ optional sides, default 6) for a regular polygon in that box; polyline/filledArea/measureArea/measurePerimeter need points:[{x,y},...]; spline needs controlPoints; draw needs path; comment needs x/y. Optional style props (color, strokeColor, fillColor, lineWidth, opacity, text, fontSize, scaleString, units, leaderStartX/Y, leaderEndX/Y, dimShowUnit (measureDistance: false shows the number only), dimLineOvershootMm / dimExtGapMm / dimExtOvershootMm (measureDistance: overshoot of the dimension line, gap and overshoot of the extension lines, in paper mm), measureShowLabel (measureArea: false hides its own label), ...) override the tool defaults. measure* annotations get measureText computed from the document scale automatically. Returns the new annotation id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["line", "arrow", "wall", "box", "mask", "redaction", "viewport", "circle", "highlight", "textHighlight", "cloud", "polygon", "polyline", "cloudPolyline", "spline", "draw", "filledArea", "textbox", "callout", "comment", "stamp", "signature", "image", "parametricSymbol", "measureDistance", "measureArea", "measurePerimeter", "scaleRegion", "count"]
+                        },
+                        "page":  { "type": "integer", "minimum": 1, "description": "1-based target page. Defaults to the current page." },
+                        "props": { "type": "object", "description": "Geometry + style properties for the annotation." },
+                        "layer": { "type": "string", "description": "Markup layer to draw on, by id or name (see app_list_layers). Left out: the current layer, as with the interactive tool. An unknown layer is an error; create it first with app_create_layer." }
+                    },
+                    "required": ["type", "props"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_list_annotations",
+                "description": "List the active document's annotations as compact JSON (id, type, page, core geometry, colors, text/measureText, and the markup layer when it is not the default layer). Optionally filter to one page or one layer.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "page": { "type": "integer", "minimum": 1, "description": "Only annotations on this 1-based page." },
+                        "layer": { "type": "string", "description": "Only annotations on this markup layer, by id or name." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_get_annotation",
+                "description": "Return the full JSON-safe property set of one annotation by id (functions/DOM refs stripped). A grid line also reports `gridAlignment`: per end its group, whether it is locked, the number of linked ends and whether it can be locked.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_update_annotation",
+                "description": "Merge `props` onto an existing annotation (geometry, color, lineWidth, text, ...). Records a modify-undo step, recomputes measureText when measurement geometry changed, and redraws. `id` and `type` are immutable. `layer` moves the annotation to another markup layer; `props` may then be empty. Grid line (parametricSymbol `stramien`): `alignStart` / `alignEnd` true couples that end with the aligned ends of the other grid lines (dragging one end then moves them all), false unlocks it.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":    { "type": "string" },
+                        "props": { "type": "object", "description": "Property patch to merge onto the annotation." },
+                        "layer": { "type": "string", "description": "Move the annotation to this markup layer, by id or name (see app_list_layers)." }
+                    },
+                    "required": ["id", "props"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_delete_annotation",
+                "description": "Delete an annotation by id (records a delete-undo step and redraws).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_select_annotation",
+                "description": "Select one annotation by id so the properties panel and selection handles show it, exactly like clicking it with the select tool.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_clear_selection",
+                "description": "Clear the annotation selection and hide the properties panel.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_undo",
+                "description": "Undo the last annotation/page edit on the active document (same as Ctrl+Z).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_redo",
+                "description": "Redo the last undone edit on the active document (same as Ctrl+Y).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_list_tabs",
+                "description": "List all open document tabs: index, fileName, filePath, modified flag, active flag, pageCount, isUntitled, currentPage, annotationCount.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_switch_tab",
+                "description": "Activate the document tab at `index` (0-based, see app_list_tabs).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "index": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["index"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_close_tab",
+                "description": "Close the document tab at `index` (0-based). If the document has unsaved changes the call fails unless force=true (discard) or save=true (save-and-close) — it never opens a save dialog, so the bridge stays headless-safe. When save=true and the document carried digital signatures that no longer hold for the saved file, the result also contains `signaturesInvalidated: true`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "index": { "type": "integer", "minimum": 0 },
+                        "force": { "type": "boolean", "default": false, "description": "Discard unsaved changes." },
+                        "save":  { "type": "boolean", "default": false, "description": "Save unsaved changes, then close (same path as the UI dialog's Save choice)." }
+                    },
+                    "required": ["index"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_new_blank_pdf",
+                "description": "Create a new blank PDF document in a new tab (page size in PDF points; A4 portrait = 595 x 842).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "widthPt":  { "type": "number", "exclusiveMinimum": 0 },
+                        "heightPt": { "type": "number", "exclusiveMinimum": 0 },
+                        "pages":    { "type": "integer", "minimum": 1, "default": 1 }
+                    },
+                    "required": ["widthPt", "heightPt"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_save_pdf",
+                "description": "Save the active document with all annotations baked in. With `path`, saves to that file. Without `path`, saves in place — fails (instead of opening a file picker) when the document is untitled or has no real path. When the document carried digital signatures that no longer hold for the saved file, the result also contains `signaturesInvalidated: true`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Absolute target path. Omit to save in place." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_set_view_mode",
+                "description": "Switch the active document view: 'single' page, 'continuous' vertical scroll, or 'book' (two-page spread, page 1 on the right). 'book' is a continuous variant.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "type": "string", "enum": ["single", "continuous", "book"] }
+                    },
+                    "required": ["mode"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_fit_page",
+                "description": "Zoom the active document so the whole page fits the viewport (same as the Fit Page button). Returns the resulting zoom.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_fit_width",
+                "description": "Zoom the active document so the page width fills the viewport (same as the Fit Width button). Returns the resulting zoom.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_get_page_count",
+                "description": "Return the active document's page count and current page.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+{
+    "name": "app_portfolio",
+    "description": "Inspect or save a PDF Collection copy, preserving component bytes, folders, schema, sort and metadata. Save pending edits first. add[].path reads each named file from an explicit absolute local path (document and data types only) and embeds it. Folders use numeric parentId (0 for a new root); new IDs increase from the current maximum. Unsupported components are exported, never executed. saveCopy/exportComponent require a new absolute output path; existing files are refused. exportComponent writes document and data types only (no programs, scripts or shortcuts), never into autostart folders, and marks the file as downloaded. New collections get a fallback cover.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "inspect",
+                    "saveCopy",
+                    "exportComponent"
+                ]
+            },
+            "documentId": {
+                "type": "string"
+            },
+            "outputPath": {
+                "type": "string"
+            },
+            "key": {
+                "type": "string"
+            },
+            "add": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string"
+                        },
+                        "name": {
+                            "type": "string"
+                        },
+                        "folderId": {
+                            "type": "integer",
+                            "minimum": 0
+                        },
+                        "description": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "path",
+                        "name"
+                    ],
+                    "additionalProperties": false
+                },
+                "maxItems": 1000
+            },
+            "remove": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "folders": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string"
+                        },
+                        "parentId": {
+                            "type": "integer",
+                            "minimum": 0
+                        }
+                    },
+                    "required": [
+                        "name",
+                        "parentId"
+                    ],
+                    "additionalProperties": false
+                },
+                "maxItems": 1000
+            },
+            "descriptions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string"
+                        },
+                        "description": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "key",
+                        "description"
+                    ],
+                    "additionalProperties": false
+                },
+                "maxItems": 1000
+            }
+        },
+        "required": [
+            "action",
+            "documentId"
+        ],
+        "additionalProperties": false
+    }
+},
+{
+    "name": "app_recognize_form",
+    "description": "Detect heuristic form-field candidates on selected saved PDF pages, excluding existing fields. Review/correct labels, type, bounds in unrotated PDF points, required flags, radio grouping and order before setting accepted=true. saveCopy requires the returned revision and sourceId plus a NEW PDF outputPath. Existing fields/artwork remain. OCR labels require desktop OCR; no fields are accepted automatically.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "detect",
+                    "saveCopy"
+                ]
+            },
+            "documentId": {
+                "type": "string"
+            },
+            "pages": {
+                "type": "array",
+                "items": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "minItems": 1,
+                "maxItems": 50
+            },
+            "ocr": {
+                "type": "boolean"
+            },
+            "lang": {
+                "type": "string"
+            },
+            "revision": {
+                "type": "integer"
+            },
+            "sourceId": {
+                "type": "string"
+            },
+            "outputPath": {
+                "type": "string"
+            },
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "page": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "type": {
+                            "type": "string",
+                            "enum": [
+                                "text",
+                                "checkbox",
+                                "radio"
+                            ]
+                        },
+                        "name": {
+                            "type": "string"
+                        },
+                        "label": {
+                            "type": "string"
+                        },
+                        "required": {
+                            "type": "boolean"
+                        },
+                        "accepted": {
+                            "type": "boolean"
+                        },
+                        "order": {
+                            "type": "number"
+                        },
+                        "group": {
+                            "type": "string"
+                        },
+                        "groupLabel": {
+                            "type": "string"
+                        },
+                        "option": {
+                            "type": "string"
+                        },
+                        "bounds": {
+                            "type": "object",
+                            "properties": {
+                                "x": {
+                                    "type": "number"
+                                },
+                                "y": {
+                                    "type": "number"
+                                },
+                                "width": {
+                                    "type": "number"
+                                },
+                                "height": {
+                                    "type": "number"
+                                }
+                            },
+                            "required": [
+                                "x",
+                                "y",
+                                "width",
+                                "height"
+                            ],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": [
+                        "page",
+                        "type",
+                        "name",
+                        "label",
+                        "accepted",
+                        "order",
+                        "bounds"
+                    ],
+                    "additionalProperties": true
+                },
+                "maxItems": 1000
+            }
+        },
+        "required": [
+            "action",
+            "documentId"
+        ],
+        "additionalProperties": false
+    }
+},
+{
+    "name": "app_search_symbols",
+    "description": "Search page artwork for a selected symbol rectangle in current page-view coordinates at scale 1. Review candidates before accept, which creates undoable standard count annotations without duplicating same-category counts at the same location. Search bounded to 20 pages, 1200 pixels per edge and 1000 results. Similarity is not certainty. Results expire after 20 minutes or source changes. navigate reveals a result.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "search",
+                    "accept",
+                    "navigate"
+                ]
+            },
+            "documentId": {
+                "type": "string"
+            },
+            "templatePage": {
+                "type": "integer",
+                "minimum": 1
+            },
+            "rect": {
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "number"
+                    },
+                    "y": {
+                        "type": "number"
+                    },
+                    "width": {
+                        "type": "number"
+                    },
+                    "height": {
+                        "type": "number"
+                    }
+                },
+                "required": [
+                    "x",
+                    "y",
+                    "width",
+                    "height"
+                ],
+                "additionalProperties": false
+            },
+            "pages": {
+                "type": "array",
+                "items": {
+                    "type": "integer",
+                    "minimum": 1
+                },
+                "maxItems": 20
+            },
+            "threshold": {
+                "type": "number",
+                "minimum": 0.5,
+                "maximum": 1
+            },
+            "rotations": {
+                "type": "array",
+                "items": {
+                    "type": "integer",
+                    "enum": [
+                        0,
+                        90,
+                        180,
+                        270
+                    ]
+                },
+                "maxItems": 4
+            },
+            "scales": {
+                "type": "array",
+                "items": {
+                    "type": "number",
+                    "minimum": 0.5,
+                    "maximum": 2
+                },
+                "maxItems": 3
+            },
+            "queryId": {
+                "type": "string"
+            },
+            "id": {
+                "type": "string"
+            },
+            "ids": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "maxItems": 1000
+            },
+            "category": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string"
+                    },
+                    "name": {
+                        "type": "string"
+                    },
+                    "color": {
+                        "type": "string",
+                        "pattern": "^#[0-9a-fA-F]{6}$"
+                    },
+                    "markerStyle": {
+                        "type": "string",
+                        "enum": [
+                            "dot"
+                        ]
+                    }
+                },
+                "required": [
+                    "id"
+                ],
+                "additionalProperties": false
+            }
+        },
+        "required": [
+            "action",
+            "documentId"
+        ],
+        "additionalProperties": false
+    }
+},
+{
+    "name": "app_workbook_bindings",
+    "description": "Persist mappings from a named schedule on a source PDF to numeric XLSX cells. list reports source/schedule/workbook status; bind creates or explicitly rebinds an id to the active source. preview returns fresh values, CSV and provenance without writing. refresh explicitly updates only mapped workbook cells (desktop, source must be active), preserving other formulas/formatting and requesting recalculation. Formula/merged/protected targets are refused. inspectWorkbook lists worksheets; export returns portable binding data; remove disconnects.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "list",
+                    "bind",
+                    "preview",
+                    "refresh",
+                    "inspectWorkbook",
+                    "export",
+                    "remove"
+                ]
+            },
+            "id": {
+                "type": "string"
+            },
+            "name": {
+                "type": "string"
+            },
+            "documentId": {
+                "type": "string"
+            },
+            "scheduleId": {
+                "type": "string"
+            },
+            "workbookPath": {
+                "type": "string"
+            },
+            "sheet": {
+                "type": "string"
+            },
+            "path": {
+                "type": "string"
+            },
+            "mappings": {
+                "type": "array",
+                "maxItems": 1000,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "field": {
+                            "type": "string"
+                        },
+                        "cell": {
+                            "type": "string"
+                        },
+                        "unit": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "field",
+                        "cell",
+                        "unit"
+                    ],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": [
+            "action"
+        ],
+        "additionalProperties": false
+    }
+},
+{
+    "name": "app_document_workflows",
+    "description": "Save/export (list) named version-1 document workflows, remove by name, run selected PDF paths into a separate output folder, start explicit watched input/output folders, or stop/cancel. Supported ordered steps: rotate {angle:0|90|180|270}, cropMargins {left,right,top,bottom} in unrotated PDF points, metadata {title,author,subject}. Workflow has version:1,name,suffix (letters/digits/_/-),steps. New outputs only, deterministic names and retry detection; no uploads. Watch requires the desktop app to stay open and does not resume automatically.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "list",
+                    "save",
+                    "remove",
+                    "run",
+                    "watch",
+                    "stop"
+                ]
+            },
+            "name": {
+                "type": "string"
+            },
+            "workflow": {
+                "type": "object"
+            },
+            "paths": {
+                "type": "array",
+                "maxItems": 1000,
+                "items": {
+                    "type": "string"
+                }
+            },
+            "input": {
+                "type": "string"
+            },
+            "output": {
+                "type": "string"
+            }
+        },
+        "required": [
+            "action"
+        ],
+        "additionalProperties": false
+    }
+},
+{
+    "name": "app_drawing_sets",
+    "description": "Manage a portable version-1 multi-file drawing set. list returns manifest/root/report; capture stages active PDF pages; import validates a manifest; root selects local package root; preview returns matches/base; commit requires that base, sheets and one resolution per sheet (existing id/new/ignore). open accepts sheet id and version index. transferPreview requires source/target version records and optional dx/dy in points, both documents open and target active; transferApply requires preview id, selected source annotation ids and confirmed:true. No PDF writes; transferred markups are one undo step.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "list",
+                    "capture",
+                    "import",
+                    "root",
+                    "preview",
+                    "commit",
+                    "open",
+                    "transferPreview",
+                    "transferApply"
+                ]
+            },
+            "manifest": {
+                "type": "object"
+            },
+            "root": {
+                "type": "string"
+            },
+            "sheets": {
+                "type": "array",
+                "items": {
+                    "type": "object"
+                }
+            },
+            "resolutions": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "base": {
+                "type": "string"
+            },
+            "id": {
+                "type": "string"
+            },
+            "version": {
+                "type": "integer",
+                "minimum": 0
+            },
+            "source": {
+                "type": "object"
+            },
+            "target": {
+                "type": "object"
+            },
+            "dx": {
+                "type": "number"
+            },
+            "dy": {
+                "type": "number"
+            },
+            "selected": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "confirmed": {
+                "type": "boolean"
+            }
+        },
+        "required": [
+            "action"
+        ],
+        "additionalProperties": false
+    }
+},
+{
+    "name": "app_sheet_links",
+    "description": "Build reviewed relative PDF links across a package. index lists open saved PDFs and editable page labels; scan accepts files [{documentId,path}] and index [{id,path,page,label,region:null|[left,bottom,right,top]}], optional literal prefix and caseSensitive. Existing OCR text layers are included. Returns immutable hit ids with resolved/ambiguous/missing targets and existing-link overlaps. export accepts scan id, selections [{hitId,targetId}], optional replaceExisting and a new desktop outputPath ending .zip; exports all source copies with relative GoTo/GoToR links and report, never edits originals. cancel stops scanning. Max 100 pages, 250 MB and 2000 hits.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "index",
+                    "scan",
+                    "cancel",
+                    "export"
+                ]
+            },
+            "files": {
+                "type": "array",
+                "items": {
+                    "type": "object"
+                }
+            },
+            "index": {
+                "type": "array",
+                "items": {
+                    "type": "object"
+                }
+            },
+            "prefix": {
+                "type": "string"
+            },
+            "caseSensitive": {
+                "type": "boolean"
+            },
+            "id": {
+                "type": "string"
+            },
+            "selections": {
+                "type": "array",
+                "items": {
+                    "type": "object"
+                }
+            },
+            "replaceExisting": {
+                "type": "boolean"
+            },
+            "outputPath": {
+                "type": "string"
+            }
+        },
+        "required": [
+            "action"
+        ],
+        "additionalProperties": false
+    }
+},
+{
+    "name": "app_approval_routing",
+    "description": "Local-file-v1 electronic approval routing, no network sending or certificate signing. Explicit configure adapter/enabled:true first. draft captures the active saved PDF hash with title/revision, sequential|parallel mode, nullable expiresAt, recipients [{id,name,email}], fields [{id,recipientId,page,x,y,width,height,label}]. list shows immutable document identity, state and audit. submit requires id and confirmedHash after exact-source review; it releases for manual handoff only. receipt imports a self-reported decision bound to request/document/recipient. cancel and supersede track distinct states. createReceipt requires confirmed:true, the explicit confirmation the dialog asks for; events created over MCP record MCP as the actor. verify checks an exported record hash chain, not identity authenticity. export writes original PDF plus audit/request JSON into a new desktop ZIP outputPath; no permanent login.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "configure",
+                    "draft",
+                    "list",
+                    "submit",
+                    "receipt",
+                    "cancel",
+                    "supersede",
+                    "verify",
+                    "export",
+                    "createReceipt"
+                ]
+            },
+            "adapter": {
+                "type": "string"
+            },
+            "enabled": {
+                "type": "boolean"
+            },
+            "title": {
+                "type": "string"
+            },
+            "revision": {
+                "type": "string"
+            },
+            "mode": {
+                "type": "string",
+                "enum": [
+                    "sequential",
+                    "parallel"
+                ]
+            },
+            "expiresAt": {
+                "type": [
+                    "string",
+                    "null"
+                ]
+            },
+            "recipients": {
+                "type": "array",
+                "items": {
+                    "type": "object"
+                }
+            },
+            "fields": {
+                "type": "array",
+                "items": {
+                    "type": "object"
+                }
+            },
+            "id": {
+                "type": "string"
+            },
+            "confirmedHash": {
+                "type": "string"
+            },
+            "receipt": {
+                "type": "object"
+            },
+            "replacementId": {
+                "type": "string"
+            },
+            "record": {
+                "type": "object"
+            },
+            "outputPath": {
+                "type": "string"
+            },
+            "recipientId": {
+                "type": "string"
+            },
+            "decision": {
+                "type": "string",
+                "enum": [
+                    "approved",
+                    "rejected"
+                ]
+            },
+            "comment": {
+                "type": "string"
+            },
+            "confirmed": {
+                "type": "boolean"
+            }
+        },
+        "required": [
+            "action"
+        ],
+        "additionalProperties": false
+    }
+},
+            {
+                "name": "app_search_documents",
+                "description": "Search text and optional comments in the active PDF, all open PDFs, or PDF files directly in a desktop folder. Reads open unsaved documents in memory; never saves or uploads. Returns grouped file statuses and bounded matches with page labels, snippets and coordinates. Encrypted, unreadable and textless pages are reported separately. No persistent index. Refine the query when truncated.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 500
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": [
+                                "active",
+                                "open",
+                                "folder"
+                            ],
+                            "default": "open"
+                        },
+                        "folder": {
+                            "type": "string",
+                            "description": "Required for folder scope; desktop only, non-recursive."
+                        },
+                        "annotations": {
+                            "type": "boolean",
+                            "default": true
+                        },
+                        "matchCase": {
+                            "type": "boolean",
+                            "default": false
+                        },
+                        "wholeWord": {
+                            "type": "boolean",
+                            "default": false
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 2000,
+                            "default": 500
+                        }
+                    },
+                    "required": [
+                        "query"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            {
+    "name": "app_locations",
+    "description": "List computed markup locations or edit named spatial zones and explicit location overrides. Mutations require the active documentId and annotationId. Zones use existing straight polygons or unrotated boxes. Reuses undo and saves metadata with the PDF.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "list",
+                    "zone",
+                    "removeZone",
+                    "override",
+                    "automatic"
+                ]
+            },
+            "documentId": {
+                "type": "string"
+            },
+            "annotationId": {
+                "type": "string"
+            },
+            "name": {
+                "type": "string"
+            },
+            "parentId": {
+                "type": "string"
+            },
+            "value": {
+                "type": "string"
+            }
+        },
+        "required": [
+            "action"
+        ],
+        "additionalProperties": false
+    }
+},
+            {
+    "name": "app_hidden_information",
+    "description": "Inspect structural metadata, comments, embedded files, actions and optional-content indicators in the saved active PDF. Export selected removable categories to a NEW PDF and JSON report; existing files are never overwritten. Pending changes must be saved first. Hidden/covered text, image pixels and optional-content layers are not removed; existing signatures cannot survive rewriting.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "inspect",
+                    "export"
+                ]
+            },
+            "documentId": {
+                "type": "string"
+            },
+            "categories": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "metadata",
+                        "comments",
+                        "attachments",
+                        "actions"
+                    ]
+                }
+            },
+            "outputPath": {
+                "type": "string"
+            }
+        },
+        "required": [
+            "action",
+            "documentId"
+        ],
+        "additionalProperties": false
+    }
+},
+            {
+    "name": "app_print_preflight",
+    "description": "Inspect the saved active PDF against a reusable print profile. Reports page/object, severity, expected and observed values for fonts, image DPI, color, transparency, page boxes and output intent. Not a PDF/X or PDF/A certificate. fixTrimBoxes explicitly writes a NEW copy and report and rechecks; existing files are refused. Save pending edits first.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "inspect",
+                    "fixTrimBoxes"
+                ]
+            },
+            "documentId": {
+                "type": "string"
+            },
+            "profile": {
+                "type": "object",
+                "properties": {
+                    "version": {
+                        "type": "integer",
+                        "enum": [
+                            1
+                        ]
+                    },
+                    "name": {
+                        "type": "string"
+                    },
+                    "minDpi": {
+                        "type": "number",
+                        "minimum": 36,
+                        "maximum": 2400
+                    },
+                    "embeddedFonts": {
+                        "type": "boolean"
+                    },
+                    "allowRgb": {
+                        "type": "boolean"
+                    },
+                    "allowTransparency": {
+                        "type": "boolean"
+                    },
+                    "outputIntent": {
+                        "type": "boolean"
+                    }
+                },
+                "additionalProperties": false
+            },
+            "outputPath": {
+                "type": "string"
+            }
+        },
+        "required": [
+            "action",
+            "documentId"
+        ],
+        "additionalProperties": false
+    }
+},
+            {
+    "name": "app_review_ocr",
+    "description": "List low/unknown-confidence OCR words with page coordinates and review state, or accept/correct one word. Requires documentId; mutations also require revision and expectedText from the list to reject stale edits. Save afterward to replace the invisible OCR text layer. Never paints over the scan. Results are paginated.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "list",
+                    "accept",
+                    "correct"
+                ]
+            },
+            "documentId": {
+                "type": "string"
+            },
+            "threshold": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 100
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000
+            },
+            "revision": {
+                "type": "integer"
+            },
+            "page": {
+                "type": "integer",
+                "minimum": 1
+            },
+            "index": {
+                "type": "integer",
+                "minimum": 0
+            },
+            "expectedText": {
+                "type": "string"
+            },
+            "text": {
+                "type": "string",
+                "maxLength": 2000
+            }
+        },
+        "required": [
+            "action",
+            "documentId"
+        ],
+        "additionalProperties": false
+    }
+},
+            {
+                "name": "app_get_page_text",
+                "description": "Read existing PDF page text without mouse automation. Returns document-bound span IDs, readable merged text, page-space bounding boxes, PDF anchors, font family/size, rotation and fill colour when recoverable. Pass a page number or omit it for the current page. Text is never sent outside the local MCP connection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "page": { "type": "integer", "minimum": 1, "description": "1-based page number; defaults to the current page." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_replace_text",
+                "description": "Replace one existing PDF text span returned by app_get_page_text. Requires the exact expected text to reject stale IDs. Preserves the page artwork by refusing edits that cannot remove the original text in place; fits the replacement inside its original width and embeds a full fallback font when the subset lacks glyphs. On a scanned page with an invisible OCR layer the scanned word is covered and the replacement is drawn visibly, as in the editor (reply: coveredScannedText). Changes stay pending until app_save_pdf is called. One line per call; for translation, map translated lines to span IDs and call repeatedly.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "spanId": { "type": "string", "description": "Opaque span ID from app_get_page_text." },
+                        "expectedText": { "type": "string", "description": "Exact current text returned for that span." },
+                        "newText": { "type": "string", "description": "Replacement text on one line (may be empty to delete)." },
+                        "color": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$", "description": "Required only when the source fill colour could not be recovered." }
+                    },
+                    "required": ["spanId", "expectedText", "newText"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_translate_page",
+                "description": "Replace many text spans of one page in a single call, for example to translate the page. Takes spans from app_get_page_text with their exact expected text. All or nothing: if any replacement fails, nothing changes and the result lists the error per span. Same rules as app_replace_text (in-place removal, fit to the original width, full fallback font when the subset lacks glyphs), checked together on one copy of the PDF and applied as one undo step. Changes stay pending until app_save_pdf is called.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "page": { "type": "integer", "minimum": 1, "description": "1-based page number; defaults to the page of the first spanId." },
+                        "replacements": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 500,
+                            "description": "One entry per span to replace, each on one line.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "spanId": { "type": "string", "description": "Opaque span ID from app_get_page_text." },
+                                    "expectedText": { "type": "string", "description": "Exact current text returned for that span." },
+                                    "newText": { "type": "string", "description": "Replacement text on one line (may be empty to delete)." },
+                                    "color": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$", "description": "Required only when the source fill colour could not be recovered." }
+                                },
+                                "required": ["spanId", "expectedText", "newText"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["replacements"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_set_measure_scale",
+                "description": "Set the active document's measurement scale calibration (pixels per unit + unit, e.g. ~2.835 px/mm for 1:1 at 72 dpi) and recalculate every measurement annotation.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pixelsPerUnit": { "type": "number", "exclusiveMinimum": 0 },
+                        "unit":          { "type": "string", "description": "Unit name, e.g. mm, cm, m, in, ft." }
+                    },
+                    "required": ["pixelsPerUnit", "unit"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_get_takeoff",
+                "description": "Return take-off totals for the user's named schedules (Staten): per schedule the element count, the numeric column grand totals (e.g. area m2, length m, count), and per-group subtotals. Optionally target one schedule by id or name; otherwise all schedules are returned. Image/thumbnail columns are reported as counts, never as data-URLs.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scheduleId": { "type": "string", "description": "Target one schedule by its id." },
+                        "name":       { "type": "string", "description": "Target one schedule by its display name." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_place_schedule",
+                "description": "Build a quantities schedule (Staat) from the annotations in the open document and place it on the page as a table annotation. Without scheduleId a new schedule is created from a template (default 'area'); `config` then overrides its categories/fields/sort. The table contents are computed by the app from the live annotations - the caller supplies no cell values.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scheduleId": { "type": "string", "description": "Reuse an existing schedule instead of creating one." },
+                        "templateId": { "type": "string", "description": "Template for a new schedule: area, length, count, symbol, text, image, full, buigstaat (rebar bending schedule) or wapeningsstaat (rebar weight per diameter). Default: area." },
+                        "name":       { "type": "string", "description": "Display name for the schedule." },
+                        "config":     { "type": "object", "description": "Schedule config: categories, fields, filters, sort, itemize, format. Overrides the template.", "additionalProperties": true },
+                        "page":       { "type": "number", "description": "Page to place the table on (default: current page)." },
+                        "x":          { "type": "number", "description": "Left edge in page points (default 40)." },
+                        "y":          { "type": "number", "description": "Top edge in page points (default 40)." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_structural_layout",
+                "description": "Set out a structural floor plan in one undoable step: the grid (lettered and numbered grid lines with bubbles), columns on the grid intersections, beams along the grid lines, a span-direction arrow per floor bay carrying the real span, spot elevations, position tags (position number / section / level) and - unless switched off - a quantity schedule grouped by IFC category. Bay sizes are REAL millimetres; the app converts them to page points at `scale` and also calibrates the measuring scale so later measurements agree. Profiles: \"HE200B\", \"HEA 200\", \"IPE 300\", \"UNP 200\", \"K100/5\" (square hollow section; rectangular: \"Koker 100x50x5\"), \"L 100x100x10\" (steel) or \"300x500\" (concrete b x h in mm). Use dryRun to see what would be placed without touching the drawing.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "page":   { "type": "number", "description": "Page to draw on (default: current page)." },
+                        "origin": {
+                            "type": "object",
+                            "description": "First grid intersection, in page points (top-left origin, 100% zoom).",
+                            "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+                            "required": ["x", "y"],
+                            "additionalProperties": false
+                        },
+                        "scale":  { "type": "string", "description": "Drawing scale, e.g. '1:100' (default) or '1:50'." },
+                        "baysX":  { "description": "Bay sizes left to right in mm: [5400,5400], '2x5400' or '5400 6000'." },
+                        "baysY":  { "description": "Bay sizes top to bottom in mm, same notations as baysX." },
+                        "labelStyleX": { "type": "string", "enum": ["letters", "numbers"], "description": "Label style for the vertical grid lines (default letters)." },
+                        "labelStyleY": { "type": "string", "enum": ["letters", "numbers"], "description": "Label style for the horizontal grid lines (default numbers)." },
+                        "labelsYFromBottom": { "type": "boolean", "description": "Number the horizontal grid lines from the bottom up, as on a drawing (default true)." },
+                        "gridExtensionMm":   { "type": "number", "description": "How far a grid line runs past the outer bay, in mm (default 1500)." },
+                        "textHeightMm":      { "type": "number", "description": "Tag text height in PAPER mm (default 2.5)." },
+                        "gridBubbleMm":      { "type": "number", "description": "Grid bubble radius in PAPER mm (default 4)." },
+                        "columns": { "description": "false to omit, or { profile, prefix, levelMm, skip: [grid labels] }." },
+                        "beams":   { "description": "false to omit, or { profile, direction: x|y|both, prefix, levelMm, edgeOnly }." },
+                        "floors":  { "description": "false to omit, or { direction: x|y|shortest, thicknessMm, levelMm, prefix, text }." },
+                        "levelMarkers": { "type": "boolean", "description": "Place a spot elevation per floor bay when a level is given (default true)." },
+                        "tags":         { "type": "boolean", "description": "Tag each element with position number, section and level (default true)." },
+                        "schedule":     { "description": "false to omit, or { name, x, y, itemize } for the quantity schedule." },
+                        "setMeasureScale": { "type": "boolean", "description": "Also calibrate the document's measuring scale to this drawing scale (default true)." },
+                        "dryRun":       { "type": "boolean", "description": "Only compute and report; draw nothing." }
+                    },
+                    "required": ["origin", "baysX", "baysY"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_list_commands",
+                "description": "List EVERY function the app exposes: each ribbon tab, each ribbon button on every tab (label, tab, disabled/active state) plus every drawing tool. Use this to discover how a feature is called before running it with app_run_command. Command ids: 'ribbon-tab:<tab>' (activate a ribbon tab), 'ribbon:#<id>' (stable), 'ribbon:<tab>:<n>' (button without an id, only stable within one version), 'tool:<name>'. Optional `filter` narrows by text (matches id, label, title or tab). Tabs and buttons that an extension adds carry the extension tab id in `tab`, including tabs an extension put into the ribbon itself. Extension actions appear as 'ext:<extensionId>:<itemId>'.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "filter": { "type": "string", "description": "Case-insensitive text filter, e.g. 'scale', 'snippet', 'export'." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_run_command",
+                "description": "Run any command returned by app_list_commands: activates a ribbon tab ('ribbon-tab:<tab>'), clicks the ribbon button (switching to its tab first), runs an extension action ('ext:...') or activates the tool. Disabled buttons are refused.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Command id from app_list_commands, e.g. 'ribbon:#btn-vector-snippet', 'ribbon-tab:view' or 'tool:measureArea'." }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }
+            },
+            read_ui_tool(),
+            {
+                "name": "app_snippet_cut",
+                "description": "Cut a rectangular area from a page of the active document as a VECTOR snippet (not a raster screenshot) and put it on the app's snippet clipboard. Coordinates are app points (top-left origin, 100% zoom). Paste it into any open document with app_snippet_paste.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "x":      { "type": "number", "description": "Left edge in app points." },
+                        "y":      { "type": "number", "description": "Top edge in app points." },
+                        "width":  { "type": "number", "description": "Width in app points." },
+                        "height": { "type": "number", "description": "Height in app points." },
+                        "page":   { "type": "number", "description": "Page to cut from (default: current page)." }
+                    },
+                    "required": ["x", "y", "width", "height"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_snippet_paste",
+                "description": "Paste the vector snippet from the snippet clipboard into the active document at real size, as a movable annotation. It stays vector in the saved PDF.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "x":    { "type": "number", "description": "Left edge in app points (default 40)." },
+                        "y":    { "type": "number", "description": "Top edge in app points (default 40)." },
+                        "page": { "type": "number", "description": "Target page (default: current page)." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            import_cad_tool(),
+            export_cad_tool(),
+            export_ifcx_tool(),
+            print_to_pdf_tool(),
+            print_tool(),
+            {
+                "name": "app_list_printers",
+                "description": "List the printers the app knows, with the system default printer and, per printer, the driver, the port and whether it writes to a file instead of to paper. Reads only: it never starts a job and changes nothing. The \"Save as PDF\" target of the print dialog is not a printer — use app_print_to_pdf for that.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_list_layers",
+                "description": "List the markup layers of the active document in panel order: id, name, colour, visible, printable, locked, the number of markups on it, whether it is the current layer (where new markups land) and whether it is the default layer. Markups without a layer of their own are on the default layer. Reads only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_create_layer",
+                "description": "Create a markup layer in the active document, at the end of the layer list. Names are unique (case-insensitive). Returns the new layer. The layers are saved with the document as optional content groups, so other PDF readers can switch them too.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name":      { "type": "string", "description": "Name of the new layer." },
+                        "color":     { "type": "string", "description": "Layer colour as #rrggbb." },
+                        "visible":   { "type": "boolean", "description": "Shown on screen (default true). A hidden layer is also not printed, not exported and not selectable." },
+                        "printable": { "type": "boolean", "description": "Printed and exported (default true)." },
+                        "locked":    { "type": "boolean", "description": "Visible, but its markups cannot be selected or moved (default false)." },
+                        "current":   { "type": "boolean", "description": "Make it the current layer, so new markups land on it." }
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_set_layer",
+                "description": "Change a markup layer of the active document: switch it on or off, make it printable or not, lock or unlock it, rename it, set its colour, or make it the current layer. A layer that is switched off is not drawn, not selectable, not printed and not exported; its markups come back unchanged when it is switched on. Returns the layer and what changed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "layer":     { "type": "string", "description": "The layer, by id or name (see app_list_layers)." },
+                        "visible":   { "type": "boolean", "description": "Switch the layer on (true) or off (false)." },
+                        "printable": { "type": "boolean", "description": "Print and export the layer." },
+                        "locked":    { "type": "boolean", "description": "Lock the layer: visible, but not selectable or movable." },
+                        "name":      { "type": "string", "description": "New name. The default layer cannot be renamed." },
+                        "color":     { "type": "string", "description": "Layer colour as #rrggbb." },
+                        "current":   { "type": "boolean", "description": "true makes it the current layer." }
+                    },
+                    "required": ["layer"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_snippet_flatten",
+                "description": "Mark a pasted vector snippet as flattened: it stays visible but is no longer selectable, and on the next save it is drawn into the page content instead of being stored as an annotation.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":        { "type": "string", "description": "Annotation id of the vectorSnippet." },
+                        "flattened": { "type": "boolean", "description": "false un-flattens it again (default true)." }
+                    },
+                    "required": ["id"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_symbol_scale",
+                "description": "Get or set the placement scale for symbols from the symbol palette (1 = real size, 2 = twice as large). Applies to symbols placed from now on; symbols already on the drawing are unchanged. Range 0.1 to 10. Without `scale` it returns the current value.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scale": { "type": "number", "description": "New placement scale." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "app_titleblock",
+                "description": "Read or fill the title block fields by NAME (projectnaam, adres, opdrachtgever, status, projectnr, fase, auteur, schaal, datum_eerste, wijziging, documenttype, kenmerk — whatever the title block defines). Without `fields` it lists the fields and their current values; with `fields` it fills them, e.g. {\"projectnaam\": \"Woonhuis\", \"schaal\": \"1:50\"}. Unknown names are reported, not silently ignored.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "fields": { "type": "object", "description": "Field name to new value.", "additionalProperties": true },
+                        "page":   { "type": "number", "description": "Limit to one page (default: all pages)." }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            floorplan_tool(),
+            facade_element_tool(),
+            // Systeemtypen (#567)
+            list_system_types_tool(),
+            register_system_type_tool(),
+            update_system_type_tool(),
+            open_system_type_editor_tool(),
+            get_system_geometry_tool(),
+            // Opdrachten van extensies (#575)
+            call_extension_command_tool()
+        ]
+    });
+    if let Some(tools) = lijst["tools"].as_array_mut() {
+        let na_samenvoegen = tools
+            .iter()
+            .position(|t| t["name"] == "app_merge_pdf")
+            .map_or(tools.len(), |i| i + 1);
+        tools.splice(na_samenvoegen..na_samenvoegen, pagina_tools());
+        tools.extend(extensie_tools());
+    }
+    lijst
+}
+
+/// De `tools/list` voor een profiel: gefilterd, en elk gereedschap met de
+/// annotaties die Claude gebruikt voor toestemming (lezen gaat zonder vragen,
+/// wijzigen vraagt altijd). Zie mcp_tool_meta.rs.
+pub fn tools_list_voor(profiel: Profiel) -> Value {
+    let mut v = handle_tools_list();
+    if let Some(tools) = v["tools"].as_array_mut() {
+        tools.retain(|t| t["name"].as_str().map_or(false, |n| beschikbaar(n, profiel)));
+        for t in tools.iter_mut() {
+            if let Some(m) = t["name"].as_str().and_then(meta) {
+                t["annotations"] = json!({
+                    "title": m.titel,
+                    "readOnlyHint": m.alleen_lezen,
+                    "destructiveHint": m.wijzigt,
+                    "openWorldHint": false,
+                });
+            }
+        }
+    }
+    v
+}
+
+/// Dispatch a `tools/call` request to the matching tool handler. Returns
+/// the tool's MCP-shaped result (`content[]` + `isError`) on success, or a
+/// `(code, message)` pair that the caller wraps in a JSON-RPC error
+/// response. Tasks 7-9 add new arms to the inner `match`.
+async fn handle_tools_call(state: &AppState, params: &Value) -> Result<Value, (i32, String)> {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<missing>");
+    let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+    match name {
+        "list_test_pdfs" => tool_list_test_pdfs(state).await,
+        "screenshot_page" => tool_screenshot_page(state, &arguments).await,
+        "get_pdf_metadata" => tool_get_pdf_metadata(state, &arguments).await,
+        "screenshot_all" => tool_screenshot_all(state, &arguments).await,
+        "app_open_pdf" => tool_app_request(state, "mcp:open-pdf", &arguments, Duration::from_secs(60)).await,
+        "app_set_zoom" => tool_app_request(state, "mcp:set-zoom", &arguments, Duration::from_secs(15)).await,
+        "app_zoom_in" => tool_app_request(state, "mcp:zoom-in", &arguments, Duration::from_secs(15)).await,
+        "app_zoom_out" => tool_app_request(state, "mcp:zoom-out", &arguments, Duration::from_secs(15)).await,
+        "app_screenshot_view" => tool_app_request(state, "mcp:screenshot-view", &arguments, Duration::from_secs(30)).await,
+        // A page at a high dpi can take a while to render.
+        "app_capture_region"  => tool_app_request(state, "mcp:capture-region",  &arguments, Duration::from_secs(120)).await,
+        "app_mouse_move"  => tool_app_request(state, "mcp:mouse-move",  &arguments, Duration::from_secs(10)).await,
+        "app_mouse_click" => tool_app_request(state, "mcp:mouse-click", &arguments, Duration::from_secs(10)).await,
+        "app_mouse_drag"  => tool_app_request(state, "mcp:mouse-drag",  &arguments, Duration::from_secs(30)).await,
+        "app_scroll"      => tool_app_request(state, "mcp:scroll",      &arguments, Duration::from_secs(10)).await,
+        "app_key"         => tool_app_request(state, "mcp:key",         &arguments, Duration::from_secs(10)).await,
+        "app_type"        => tool_app_request(state, "mcp:type",        &arguments, Duration::from_secs(30)).await,
+        "app_get_viewport_state" => tool_app_request(state, "mcp:get-viewport-state", &arguments, Duration::from_secs(5)).await,
+        "app_get_recent_console" => tool_app_request(state, "mcp:get-recent-console", &arguments, Duration::from_secs(5)).await,
+        "app_wheel_zoom"         => tool_app_request(state, "mcp:wheel-zoom",         &arguments, Duration::from_secs(15)).await,
+        "app_zoom_anchor_test"   => tool_app_request(state, "mcp:zoom-anchor-test",   &arguments, Duration::from_secs(30)).await,
+        "app_clear_caches"       => tool_app_request(state, "mcp:clear-caches",       &arguments, Duration::from_secs(10)).await,
+        "app_go_to_page"         => tool_app_request(state, "mcp:go-to-page",         &arguments, Duration::from_secs(15)).await,
+        "app_set_tool"           => tool_app_request(state, "mcp:set-tool",           &arguments, Duration::from_secs(10)).await,
+        "app_click_element"      => tool_app_request(state, "mcp:click-element",      &arguments, Duration::from_secs(15)).await,
+        "app_ui_state"           => tool_app_request(state, "mcp:ui-state",           &arguments, Duration::from_secs(15)).await,
+        "app_set_window_size"    => tool_set_window_size(state, &arguments).await,
+        "app_get_current_tool"   => tool_app_request(state, "mcp:get-current-tool",   &arguments, Duration::from_secs(5)).await,
+        "app_merge_pdf"          => tool_app_request(state, "mcp:merge-pdf",           &arguments, Duration::from_secs(60)).await,
+        // Paginabewerkingen laden het document opnieuw: dezelfde grens als samenvoegen.
+        "app_rotate_pages"       => tool_app_request(state, "mcp:rotate-pages",        &arguments, Duration::from_secs(60)).await,
+        "app_delete_pages"       => tool_app_request(state, "mcp:delete-pages",        &arguments, Duration::from_secs(60)).await,
+        "app_insert_blank_pages" => tool_app_request(state, "mcp:insert-blank-pages",  &arguments, Duration::from_secs(60)).await,
+        "app_extract_pages"      => tool_app_request(state, "mcp:extract-pages",       &arguments, Duration::from_secs(120)).await,
+        "app_reorder_pages"      => tool_app_request(state, "mcp:reorder-pages",       &arguments, Duration::from_secs(60)).await,
+        "app_shift_pages"        => tool_app_request(state, "mcp:shift-pages",         &arguments, Duration::from_secs(120)).await,
+        "app_bookmarks"          => tool_app_request(state, "mcp:bookmarks",           &arguments, Duration::from_secs(15)).await,
+        "app_watermarks"         => tool_app_request(state, "mcp:watermarks",          &arguments, Duration::from_secs(30)).await,
+        "app_accounts_status"    => tool_app_request(state, "mcp:accounts-status",     &arguments, Duration::from_secs(5)).await,
+        "app_accounts_fetch"     => tool_app_request(state, "mcp:accounts-fetch",      &arguments, Duration::from_secs(30)).await,
+        // Agenttaken van extensies (#556): alleen de wachtrij, dus korte grenzen.
+        "app_agent_task_pending" => tool_app_request(state, "mcp:agent-task-pending",  &arguments, Duration::from_secs(10)).await,
+        "app_agent_task_result"  => tool_app_request(state, "mcp:agent-task-result",   &arguments, Duration::from_secs(10)).await,
+        "app_create_annotation"  => tool_app_request(state, "mcp:create-annotation",  &arguments, Duration::from_secs(15)).await,
+        "app_list_annotations"   => tool_app_request(state, "mcp:list-annotations",   &arguments, Duration::from_secs(10)).await,
+        "app_get_annotation"     => tool_app_request(state, "mcp:get-annotation",     &arguments, Duration::from_secs(10)).await,
+        "app_update_annotation"  => tool_app_request(state, "mcp:update-annotation",  &arguments, Duration::from_secs(15)).await,
+        "app_delete_annotation"  => tool_app_request(state, "mcp:delete-annotation",  &arguments, Duration::from_secs(15)).await,
+        "app_select_annotation"  => tool_app_request(state, "mcp:select-annotation",  &arguments, Duration::from_secs(10)).await,
+        "app_clear_selection"    => tool_app_request(state, "mcp:clear-selection",    &arguments, Duration::from_secs(10)).await,
+        "app_undo"               => tool_app_request(state, "mcp:undo",               &arguments, Duration::from_secs(15)).await,
+        "app_redo"               => tool_app_request(state, "mcp:redo",               &arguments, Duration::from_secs(15)).await,
+        "app_list_tabs"          => tool_app_request(state, "mcp:list-tabs",          &arguments, Duration::from_secs(5)).await,
+        "app_switch_tab"         => tool_app_request(state, "mcp:switch-tab",         &arguments, Duration::from_secs(15)).await,
+        "app_close_tab"          => tool_app_request(state, "mcp:close-tab",          &arguments, Duration::from_secs(15)).await,
+        "app_new_blank_pdf"      => tool_app_request(state, "mcp:new-blank-pdf",      &arguments, Duration::from_secs(60)).await,
+        "app_save_pdf"           => tool_app_request(state, "mcp:save-pdf",           &arguments, Duration::from_secs(120)).await,
+        "app_set_view_mode"      => tool_app_request(state, "mcp:set-view-mode",      &arguments, Duration::from_secs(30)).await,
+        "app_fit_page"           => tool_app_request(state, "mcp:fit-page",           &arguments, Duration::from_secs(15)).await,
+        "app_fit_width"          => tool_app_request(state, "mcp:fit-width",          &arguments, Duration::from_secs(15)).await,
+        "app_get_page_count"     => tool_app_request(state, "mcp:get-page-count",     &arguments, Duration::from_secs(5)).await,
+        "app_search_documents"   => tool_app_request(state, "mcp:search-documents", &arguments, Duration::from_secs(300)).await,
+        "app_locations"          => tool_app_request(state, "mcp:locations", &arguments, Duration::from_secs(30)).await,
+        "app_hidden_information" => tool_app_request(state, "mcp:hidden-information", &arguments, Duration::from_secs(300)).await,
+        "app_print_preflight"    => tool_app_request(state, "mcp:print-preflight", &arguments, Duration::from_secs(300)).await,
+        "app_review_ocr"         => tool_app_request(state, "mcp:review-ocr", &arguments, Duration::from_secs(60)).await,
+        "app_portfolio"          => tool_app_request(state, "mcp:portfolio", &arguments, Duration::from_secs(300)).await,
+        "app_recognize_form"     => tool_app_request(state, "mcp:recognize-form", &arguments, Duration::from_secs(300)).await,
+        "app_search_symbols"     => tool_app_request(state, "mcp:search-symbols", &arguments, Duration::from_secs(300)).await,
+        "app_workbook_bindings"  => tool_app_request(state, "mcp:workbook-bindings", &arguments, Duration::from_secs(300)).await,
+        "app_document_workflows" => tool_app_request(state, "mcp:document-workflows", &arguments, Duration::from_secs(300)).await,
+        "app_drawing_sets" => tool_app_request(state, "mcp:drawing-sets", &arguments, Duration::from_secs(300)).await,
+        "app_sheet_links" => tool_app_request(state, "mcp:sheet-links", &arguments, Duration::from_secs(300)).await,
+        "app_approval_routing" => tool_app_request(state, "mcp:approval-routing", &arguments, Duration::from_secs(300)).await,
+        "app_get_page_text"      => tool_app_request(state, "mcp:get-page-text",      &arguments, Duration::from_secs(60)).await,
+        "app_replace_text"       => tool_app_request(state, "mcp:replace-text",       &arguments, Duration::from_secs(120)).await,
+        "app_translate_page"     => tool_app_request(state, "mcp:translate-page",     &arguments, Duration::from_secs(300)).await,
+        "app_set_measure_scale"  => tool_app_request(state, "mcp:set-measure-scale",  &arguments, Duration::from_secs(15)).await,
+        "app_get_takeoff"        => tool_app_request(state, "mcp:get-takeoff",        &arguments, Duration::from_secs(10)).await,
+        "app_place_schedule"     => tool_app_request(state, "mcp:place-schedule",     &arguments, Duration::from_secs(15)).await,
+        "app_structural_layout"  => tool_app_request(state, "mcp:structural-layout",  &arguments, Duration::from_secs(60)).await,
+        "app_list_commands"      => tool_app_request(state, "mcp:list-commands",      &arguments, Duration::from_secs(30)).await,
+        "app_run_command"        => tool_app_request(state, "mcp:run-command",        &arguments, Duration::from_secs(20)).await,
+        "app_read_ui"            => tool_app_request(state, "mcp:read-ui",            &arguments, Duration::from_secs(10)).await,
+        "app_snippet_cut"        => tool_app_request(state, "mcp:snippet-cut",        &arguments, Duration::from_secs(60)).await,
+        "app_snippet_paste"      => tool_app_request(state, "mcp:snippet-paste",      &arguments, Duration::from_secs(15)).await,
+        "app_snippet_flatten"    => tool_app_request(state, "mcp:snippet-flatten",    &arguments, Duration::from_secs(10)).await,
+        "app_symbol_scale"       => tool_app_request(state, "mcp:symbol-scale",       &arguments, Duration::from_secs(10)).await,
+        "app_titleblock"         => tool_app_request(state, "mcp:titleblock",         &arguments, Duration::from_secs(15)).await,
+        "app_floorplan"          => tool_app_request(state, "mcp:floorplan",          &arguments, Duration::from_secs(60)).await,
+        "app_facade_element"     => tool_app_request(state, "mcp:facade-element",     &arguments, Duration::from_secs(30)).await,
+        "app_import_cad"         => tool_app_request(state, "mcp:import-cad",         &arguments, Duration::from_secs(300)).await,
+        "app_export_cad"         => tool_app_request(state, "mcp:export-cad",         &arguments, Duration::from_secs(300)).await,
+        "app_export_ifcx"        => tool_app_request(state, "mcp:export-ifcx",        &arguments, Duration::from_secs(300)).await,
+        // Afdrukken: een A0 op 300 dpi renderen duurt minuten, dus dezelfde
+        // ruime grens als de CAD-omzetting. De JS-kant breekt net eerder af
+        // (print-opdracht.js TIJDGRENS_MS), zodat er na "timed out" geen
+        // bestand meer verschijnt en er niets meer naar de printer gaat.
+        "app_print_to_pdf"       => tool_app_request(state, "mcp:print-to-pdf",       &arguments, Duration::from_secs(300)).await,
+        "app_print"              => tool_app_request(state, "mcp:print",              &arguments, Duration::from_secs(300)).await,
+        "app_list_printers"      => tool_app_request(state, "mcp:list-printers",      &arguments, Duration::from_secs(30)).await,
+        // Annotatielagen (#468): alleen het model, dus korte grenzen.
+        "app_list_layers"        => tool_app_request(state, "mcp:list-layers",        &arguments, Duration::from_secs(10)).await,
+        "app_create_layer"       => tool_app_request(state, "mcp:create-layer",       &arguments, Duration::from_secs(10)).await,
+        "app_set_layer"          => tool_app_request(state, "mcp:set-layer",          &arguments, Duration::from_secs(10)).await,
+        // Systeemtypen (#567): alleen de bibliotheek, dus korte grenzen.
+        "app_list_system_types"       => tool_app_request(state, "mcp:list-system-types",       &arguments, Duration::from_secs(10)).await,
+        "app_register_system_type"    => tool_app_request(state, "mcp:register-system-type",    &arguments, Duration::from_secs(10)).await,
+        "app_update_system_type"      => tool_app_request(state, "mcp:update-system-type",      &arguments, Duration::from_secs(10)).await,
+        "app_open_system_type_editor" => tool_app_request(state, "mcp:open-system-type-editor", &arguments, Duration::from_secs(10)).await,
+        "app_get_system_geometry"     => tool_app_request(state, "mcp:get-system-geometry",     &arguments, Duration::from_secs(10)).await,
+        // Opdrachten van extensies (#575); zonder JSON-RPC-id (mcp_handler geeft dat mee).
+        "app_call_extension_command" => extensie_aanroep(state, name, params, &Value::Null).await,
+        // Extensies (#550): installeren pakt uit en activeert; de JS-kant breekt eerder af.
+        "app_list_extensions"    => tool_app_request(state, "mcp:list-extensions",    &arguments, Duration::from_secs(10)).await,
+        "app_install_extension"  => tool_app_request(state, "mcp:install-extension",  &arguments, Duration::from_secs(60)).await,
+        "app_reload_extension"   => tool_app_request(state, "mcp:reload-extension",   &arguments, Duration::from_secs(30)).await,
+        other => Err((
+            jsonrpc_error::METHOD_NOT_FOUND,
+            format!("method not found: {other}"),
+        )),
+    }
+}
+
+/// Een aanroep van een extensieopdracht (#575): een `ext_`-tool zelf, of
+/// `app_call_extension_command`. De WebView controleert de argumenten tegen
+/// het schema van de opdracht en houdt zich aan de tijdgrens van de opdracht
+/// (hooguit 120 s); Rust wacht iets langer. Het JSON-RPC-id gaat mee, zodat
+/// `notifications/cancelled` precies deze aanroep kan annuleren.
+async fn extensie_aanroep(
+    state: &AppState,
+    naam: &str,
+    params: &Value,
+    rpc_id: &Value,
+) -> Result<Value, (i32, String)> {
+    let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let payload = if naam == "app_call_extension_command" {
+        json!({ "generic": true, "call": arguments, "rpcId": rpc_id })
+    } else {
+        json!({ "tool": naam, "arguments": arguments, "rpcId": rpc_id })
+    };
+    tool_app_request(state, "mcp:call-extension-command", &payload, Duration::from_secs(125)).await
+}
+
+/// Registreert een geladen extensie deze `ext_`-tool?
+fn extensie_tool_bekend(state: &AppState, naam: &str) -> bool {
+    state
+        .app_handle
+        .as_ref()
+        .and_then(|app| app.try_state::<ExtensieTools>())
+        .map_or(false, |et| et.bevat(naam))
+}
+
+/// De vaste lijst plus de opdrachten van geladen extensies (#575).
+fn tools_list_met_extensies(state: &AppState) -> Value {
+    let mut lijst = tools_list_voor(state.profiel);
+    if let Some(et) = state.app_handle.as_ref().and_then(|app| app.try_state::<ExtensieTools>()) {
+        if let Some(tools) = lijst["tools"].as_array_mut() {
+            tools.extend(et.lijst());
+        }
+    }
+    lijst
+}
+
+/// `app_set_window_size` — resize the main window from the Rust side.
+/// Runs outside the WebView so no capability/ACL entry is needed; protocol
+/// runs call this up-front to make fit-scale and margin-geometry
+/// deterministic regardless of the size the window opened with.
+async fn tool_set_window_size(state: &AppState, arguments: &Value) -> Result<Value, (i32, String)> {
+    let width = arguments.get("width").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let height = arguments.get("height").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if width < 200.0 || height < 200.0 {
+        return Err((
+            jsonrpc_error::INVALID_PARAMS,
+            "width/height must be numbers >= 200".to_string(),
+        ));
+    }
+    let app = state.app_handle.as_ref().ok_or_else(|| (
+        jsonrpc_error::INTERNAL_ERROR,
+        "AppHandle unavailable — MCP server not started from inside Tauri::setup()".to_string(),
+    ))?;
+    let window = app.get_webview_window("main").ok_or_else(|| (
+        jsonrpc_error::INTERNAL_ERROR,
+        "main window not found".to_string(),
+    ))?;
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, format!("set_size failed: {e}")))?;
+    // Give the resize + reflow a beat before reporting success.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": json!({ "ok": true, "requested": { "width": width, "height": height } }).to_string(),
+        }],
+        "isError": false,
+    }))
+}
+
+/// Generic dispatch for the `app_*` tools that drive the LIVE WebView via
+/// the [`mcp_app_bridge`]. Emits `event_name` with `arguments` as the
+/// payload's `params`, awaits the WebView's response, and wraps it in the
+/// MCP-shaped result envelope. The JS side responds with arbitrary JSON
+/// (typically `{ "ok": true, ... }` or `{ "error": "..." }`); we forward
+/// whatever it sends so per-tool conventions stay flexible.
+async fn tool_app_request(
+    state: &AppState,
+    event_name: &str,
+    arguments: &Value,
+    timeout: Duration,
+) -> Result<Value, (i32, String)> {
+    let app = state
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| (
+            jsonrpc_error::INTERNAL_ERROR,
+            "AppHandle unavailable — MCP server not started from inside Tauri::setup()".to_string(),
+        ))?;
+    let bridge = app.state::<McpAppBridge>();
+    let response = mcp_app_bridge::request(app, &bridge, event_name, arguments.clone(), timeout)
+        .await
+        .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, e))?;
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": response.to_string(),
+        }],
+        "isError": false,
+    }))
+}
+
+/// `list_test_pdfs` tool — enumerates every `*.pdf` under
+/// `state.test_pdfs_dir` and returns its absolute path, file size, and
+/// page count. Page count is read with `lopdf::Document::load_mem` inside
+/// `spawn_blocking` because lopdf does synchronous I/O.
+///
+/// The result is shaped per the MCP convention: a single text content
+/// block whose `text` field is a JSON-encoded payload. The harness in
+/// Task 13 decodes this string to recover the structured `pdfs` array.
+async fn tool_list_test_pdfs(state: &AppState) -> Result<Value, (i32, String)> {
+    let dir: &PathBuf = &state.test_pdfs_dir;
+    let mut entries = match tokio::fs::read_dir(dir.as_path()).await {
+        Ok(e) => e,
+        Err(e) => {
+            return Err((
+                jsonrpc_error::INTERNAL_ERROR,
+                format!("could not read test corpus dir {:?}: {e}", dir),
+            ));
+        }
+    };
+
+    let mut pdfs: Vec<Value> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("pdf") {
+            continue;
+        }
+        let metadata = match entry.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // page count: lopdf reads from disk synchronously, so do it on a
+        // blocking thread to keep the runtime responsive.
+        let path_for_count = path.clone();
+        let page_count = tokio::task::spawn_blocking(move || {
+            std::fs::read(&path_for_count)
+                .ok()
+                .and_then(|b| lopdf::Document::load_mem(&b).ok())
+                .map(|doc| doc.get_pages().len())
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0);
+        pdfs.push(json!({
+            "path":       path.to_string_lossy(),
+            "page_count": page_count,
+            "file_size":  metadata.len(),
+        }));
+    }
+    pdfs.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": json!({ "pdfs": pdfs }).to_string(),
+        }],
+        "isError": false,
+    }))
+}
+
+/// `screenshot_page` tool — renders a single PDF page via PDFium at a target
+/// output width (in pixels) and returns the PNG bytes encoded as base64. The
+/// MCP harness uses this to compare current renders against committed reference
+/// PNGs.
+///
+/// Scaling: `scale = width / page_w_pt` — `width` is the literal output
+/// pixel width, matching the PyMuPDF reference renderer the regression
+/// harness uses (`zoom = width / page.rect.width`). For a portrait A4 page
+/// at width=2000 this produces a 2000×2828 image, not 1415×2000 as a
+/// `max(w,h)`-based scale would. Aligning the convention is required so
+/// app-vs-reference diffs aren't dominated by an asymmetric resolution
+/// scale (portrait pages would otherwise render at ~71 % of the reference
+/// resolution and lose anti-aliased text sharpness in the side-by-side
+/// comparison).
+async fn tool_screenshot_page(
+    _state: &AppState,
+    arguments: &Value,
+) -> Result<Value, (i32, String)> {
+    let path = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| (jsonrpc_error::INVALID_PARAMS, "missing 'path'".to_string()))?
+        .to_string();
+    let page_index = arguments
+        .get("page_index")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| (jsonrpc_error::INVALID_PARAMS, "missing or invalid 'page_index'".to_string()))?
+        as usize;
+    let width = arguments
+        .get("width")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2000) as u32;
+    if width == 0 {
+        return Err((jsonrpc_error::INVALID_PARAMS, "'width' must be > 0".to_string()));
+    }
+
+    let pdf_bytes = tokio::fs::read(&path).await.map_err(|e| {
+        (
+            jsonrpc_error::INTERNAL_ERROR,
+            format!("read {}: {e}", path),
+        )
+    })?;
+
+    let (render_width, render_height, render_rgba) = tokio::task::spawn_blocking(move || -> Result<(u32, u32, Vec<u8>), String> {
+        let arc_bytes = std::sync::Arc::new(pdf_bytes.to_vec());
+        let cache = crate::pdfium_renderer::PdfiumDocCache::default();
+        let cache_key = format!("mcp:{:p}", arc_bytes.as_ptr());
+        let handle = crate::pdfium_renderer::get_or_load_pdfium_doc_with_bytes(
+            &cache_key, arc_bytes, &cache,
+        )?;
+        let doc = handle.document();
+        let scale = {
+            let _guard = crate::pdfium_renderer::inproc_guard();
+            let pages = doc.pages();
+            let page = pages
+                .get(page_index as i32)
+                .map_err(|e| format!("page_dimensions: {e}"))?;
+            // Literal-width convention to match PyMuPDF reference renderer.
+            width as f32 / page.width().value
+        };
+        crate::pdfium_renderer::render_page_to_rgba(doc, page_index as u32, scale, 0)
+    })
+    .await
+    .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, format!("render task panic: {e}")))?
+    .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, e))?;
+
+    let png_b64 = crate::render_to_png::encode_rgba_to_png_base64(
+        render_width,
+        render_height,
+        &render_rgba,
+    )
+    .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, format!("encode png: {e}")))?;
+
+    let payload = json!({
+        "png_base64": png_b64,
+        "width":  render_width,
+        "height": render_height,
+    });
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": payload.to_string(),
+        }],
+        "isError": false,
+    }))
+}
+
+/// `get_pdf_metadata` tool — reads the PDF version, producer/creator metadata,
+/// and per-page MediaBox + rotation directly from the PDF structure via
+/// `lopdf`. Used by the regression harness to confirm the rendered output
+/// matches the source document's declared geometry.
+///
+/// In lopdf 0.34 `Document.version` is a plain `String` (e.g. `"1.4"`), so it
+/// is returned verbatim as `pdf_version`. Producer/Creator are read from
+/// `/Info`, which may be either a direct dict or an indirect reference; both
+/// shapes are handled. MediaBox values may be PDF Integer or Real, and both
+/// are coerced to `f32`.
+async fn tool_get_pdf_metadata(
+    _state: &AppState,
+    arguments: &Value,
+) -> Result<Value, (i32, String)> {
+    let path = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| (jsonrpc_error::INVALID_PARAMS, "missing 'path'".to_string()))?
+        .to_string();
+
+    // lopdf is sync; offload to spawn_blocking so we don't stall the runtime.
+    let payload = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path))?;
+        let doc = lopdf::Document::load_mem(&bytes).map_err(|e| format!("parse: {e}"))?;
+
+        // lopdf 0.34: `Document.version` is `pub version: String` (e.g. "1.4").
+        let pdf_version = doc.version.clone();
+
+        // Producer / Creator from /Info
+        let mut producer = String::new();
+        let mut creator = String::new();
+        if let Ok(info_ref) = doc.trailer.get(b"Info") {
+            // /Info can be a direct dict OR an indirect reference. Resolve both.
+            let info_dict_opt = if let Ok(reference) = info_ref.as_reference() {
+                doc.get_object(reference).ok().and_then(|o| o.as_dict().ok())
+            } else {
+                info_ref.as_dict().ok()
+            };
+            if let Some(info) = info_dict_opt {
+                let read_str = |key: &[u8]| -> String {
+                    info.get(key)
+                        .ok()
+                        .and_then(|o| match o {
+                            lopdf::Object::String(s, _) => {
+                                Some(String::from_utf8_lossy(s).into_owned())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default()
+                };
+                producer = read_str(b"Producer");
+                creator = read_str(b"Creator");
+            }
+        }
+
+        // Per-page: index, mediabox, rotation
+        let pages_map = doc.get_pages(); // BTreeMap<u32 page_num, ObjectId>
+        let mut pages_json = Vec::with_capacity(pages_map.len());
+        for (idx, (_page_num, page_id)) in pages_map.iter().enumerate() {
+            let mut mediabox: Vec<f32> = Vec::new();
+            let mut rotation: i64 = 0;
+            if let Ok(p_dict) = doc.get_object(*page_id).and_then(|o| o.as_dict()) {
+                if let Ok(arr) = p_dict.get(b"MediaBox").and_then(|o| o.as_array()) {
+                    mediabox = arr
+                        .iter()
+                        .filter_map(|o| match o {
+                            lopdf::Object::Integer(i) => Some(*i as f32),
+                            lopdf::Object::Real(r) => Some(*r),
+                            _ => None,
+                        })
+                        .collect();
+                }
+                rotation = p_dict
+                    .get(b"Rotate")
+                    .ok()
+                    .and_then(|o| o.as_i64().ok())
+                    .unwrap_or(0);
+            }
+            pages_json.push(json!({
+                "index":    idx,
+                "mediabox": mediabox,
+                "rotation": rotation
+            }));
+        }
+
+        Ok(json!({
+            "pdf_version": pdf_version,
+            "page_count":  pages_map.len(),
+            "producer":    producer,
+            "creator":     creator,
+            "pages":       pages_json
+        }))
+    })
+    .await
+    .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, format!("metadata task panic: {e}")))?
+    .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, e))?;
+
+    Ok(json!({
+        "content": [{ "type": "text", "text": payload.to_string() }],
+        "isError": false
+    }))
+}
+
+/// `screenshot_all` tool — renders every page of a PDF via PDFium and returns
+/// each as a base64 PNG in a `pages` array. Pages are rendered serially to
+/// keep memory bounded for large multi-page PDFs.
+///
+/// Page count is read once via `lopdf` so we know how many render passes to
+/// schedule, then PDFium produces the raster for each page using the same
+/// scaling convention as `screenshot_page`:
+/// `scale = width / page_w_pt` (literal output width).
+async fn tool_screenshot_all(
+    _state: &AppState,
+    arguments: &Value,
+) -> Result<Value, (i32, String)> {
+    let path = arguments
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| (jsonrpc_error::INVALID_PARAMS, "missing 'path'".to_string()))?
+        .to_string();
+    let width = arguments
+        .get("width")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2000) as u32;
+    if width == 0 {
+        return Err((jsonrpc_error::INVALID_PARAMS, "'width' must be > 0".to_string()));
+    }
+
+    // First, count pages via lopdf so we know how many render passes to do.
+    let bytes = tokio::fs::read(&path).await.map_err(|e| {
+        (jsonrpc_error::INTERNAL_ERROR, format!("read {}: {e}", path))
+    })?;
+
+    let total: usize = {
+        let bytes_clone = bytes.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            let doc = lopdf::Document::load_mem(&bytes_clone)
+                .map_err(|e| format!("parse: {e}"))?;
+            Ok(doc.get_pages().len())
+        })
+        .await
+        .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, format!("count task panic: {e}")))?
+        .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, e))?
+    };
+
+    // Render every page sequentially. Parallelizing would help wall-clock time
+    // but sticking to serial keeps memory bounded for big multi-page PDFs.
+    let bytes_arc = std::sync::Arc::new(bytes);
+    let mut pages_json: Vec<Value> = Vec::with_capacity(total);
+
+    for idx in 0..total {
+        let bytes_clone = bytes_arc.clone();
+        let (rw, rh, rgba) = tokio::task::spawn_blocking(move || -> Result<(u32, u32, Vec<u8>), String> {
+            let arc_bytes = bytes_clone;
+            let cache = crate::pdfium_renderer::PdfiumDocCache::default();
+            let cache_key = format!("mcp:{:p}", arc_bytes.as_ptr());
+            let handle = crate::pdfium_renderer::get_or_load_pdfium_doc_with_bytes(
+                &cache_key, arc_bytes, &cache,
+            )?;
+            let doc = handle.document();
+            let scale = {
+                let _guard = crate::pdfium_renderer::inproc_guard();
+                let pages = doc.pages();
+                let page = pages
+                    .get(idx as i32)
+                    .map_err(|e| format!("page_dimensions[{idx}]: {e}"))?;
+                // Literal-width convention to match PyMuPDF reference renderer.
+                width as f32 / page.width().value
+            };
+            crate::pdfium_renderer::render_page_to_rgba(doc, idx as u32, scale, 0)
+        })
+        .await
+        .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, format!("render task panic on page {idx}: {e}")))?
+        .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, e))?;
+
+        let png_b64 = crate::render_to_png::encode_rgba_to_png_base64(
+            rw,
+            rh,
+            &rgba,
+        )
+        .map_err(|e| (jsonrpc_error::INTERNAL_ERROR, format!("encode png[{idx}]: {e}")))?;
+
+        pages_json.push(json!({
+            "index":      idx,
+            "png_base64": png_b64,
+            "width":      rw,
+            "height":     rh
+        }));
+    }
+
+    Ok(json!({
+        "content": [{
+            "type": "text",
+            "text": json!({ "pages": pages_json }).to_string()
+        }],
+        "isError": false
+    }))
+}
+
+/// Alleen lokale clients: de Host moet 127.0.0.1/localhost op onze poort zijn
+/// (tegen DNS-rebinding), en een eventuele Origin moet lokaal zijn (tegen een
+/// website die via de browser de app probeert te besturen). De stdio-brug
+/// stuurt geen Origin mee.
+pub fn verzoek_toegestaan(headers: &axum::http::HeaderMap, poort: u16) -> bool {
+    let lokaal = |host: &str| {
+        let host = host.trim().to_ascii_lowercase();
+        host == format!("127.0.0.1:{poort}") || host == format!("localhost:{poort}")
+    };
+    if let Some(h) = headers.get("host").and_then(|v| v.to_str().ok()) {
+        if !lokaal(h) {
+            return false;
+        }
+    }
+    if let Some(o) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        let o = o.trim().to_ascii_lowercase();
+        let zonder_schema = o.split("://").nth(1).unwrap_or("");
+        let host = zonder_schema.split(['/', ':']).next().unwrap_or("");
+        if host != "127.0.0.1" && host != "localhost" {
+            return false;
+        }
+    }
+    true
+}
+
+/// OpenAEC Linux (#863): geen `Origin`-kop (een browser stuurt die altijd mee)
+/// en `Authorization: Bearer <geheim>`, in constante tijd vergeleken. De
+/// Host-kop telt hier niet: de server luistert op het interne netwerk.
+pub fn beheerd_verzoek_toegestaan(headers: &axum::http::HeaderMap, geheim: &str) -> bool {
+    if headers.contains_key("origin") {
+        return false;
+    }
+    let Some(kop) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let kop = kop.trim();
+    let Some((schema, token)) = kop.split_once(' ') else { return false };
+    if !schema.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    gelijk_in_constante_tijd(token.trim().as_bytes(), geheim.as_bytes())
+}
+
+fn gelijk_in_constante_tijd(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() || b.is_empty() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn toegang_toegestaan(headers: &axum::http::HeaderMap, state: &AppState) -> bool {
+    match &state.toegang {
+        Toegang::Lokaal => verzoek_toegestaan(headers, state.poort),
+        Toegang::Geheim(geheim) => beheerd_verzoek_toegestaan(headers, geheim),
+    }
+}
+
+/// Axum POST handler for `/mcp`. Parses the JSON-RPC envelope and dispatches
+/// on the `method` field.
+async fn mcp_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    // Pull out the request id; default to null so error responses are still
+    // well-formed if the client omitted it.
+    let id = body.get("id").cloned().unwrap_or(Value::Null);
+
+    if !toegang_toegestaan(&headers, &state) {
+        let melding = match state.toegang {
+            Toegang::Lokaal => "only local clients may use this server",
+            Toegang::Geheim(_) => "a valid bearer secret is required and browser requests are refused",
+        };
+        return (
+            StatusCode::FORBIDDEN,
+            Json(rpc_error(id, jsonrpc_error::INVALID_REQUEST, melding)),
+        );
+    }
+
+    let method = match body.get("method").and_then(|v| v.as_str()) {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::OK,
+                Json(rpc_error(
+                    id,
+                    jsonrpc_error::INVALID_REQUEST,
+                    "missing 'method' field",
+                )),
+            );
+        }
+    };
+
+    // Signaal voor de statusbalk (mcp_signaal.rs): alleen soort, toolnaam,
+    // poort en tijd; nooit argumenten of documentinhoud.
+    match method {
+        "initialize" => crate::mcp_signaal::meld(state.app_handle.as_ref(), "connect", None, state.poort),
+        "tools/call" => {
+            let naam = body
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str());
+            crate::mcp_signaal::meld(state.app_handle.as_ref(), "call", naam, state.poort);
+        }
+        _ => {}
+    }
+
+    let response = match method {
+        "initialize" => rpc_result(id, handle_initialize()),
+        "tools/list" => rpc_result(id, tools_list_met_extensies(&state)),
+        "tools/call" => {
+            let empty = Value::Null;
+            let params = body.get("params").unwrap_or(&empty);
+            let naam = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if naam.starts_with(mcp_extensie_tools::VOORVOEGSEL) {
+                // Opdracht van een extensie (#575): alleen als een geladen
+                // extensie hem registreert.
+                if !extensie_tool_bekend(&state, naam) {
+                    rpc_error(
+                        id,
+                        jsonrpc_error::INVALID_PARAMS,
+                        format!("tool '{naam}' is not available: no loaded extension registers it (see app_list_extensions)"),
+                    )
+                } else {
+                    match extensie_aanroep(&state, naam, params, &id).await {
+                        Ok(value) => rpc_result(id, value),
+                        Err((code, msg)) => rpc_error(id, code, msg),
+                    }
+                }
+            } else if naam == "app_call_extension_command" && beschikbaar(naam, state.profiel) {
+                match extensie_aanroep(&state, naam, params, &id).await {
+                    Ok(value) => rpc_result(id, value),
+                    Err((code, msg)) => rpc_error(id, code, msg),
+                }
+            } else if !beschikbaar(naam, state.profiel) {
+                rpc_error(
+                    id,
+                    jsonrpc_error::INVALID_PARAMS,
+                    format!("tool '{naam}' is not available in this SipilPDF configuration"),
+                )
+            } else {
+                match handle_tools_call(&state, params).await {
+                    Ok(value) => rpc_result(id, value),
+                    Err((code, msg)) => rpc_error(id, code, msg),
+                }
+            }
+        }
+        // `notifications/initialized` and other notification methods carry no
+        // id and expect no response. We still send back an empty result for
+        // robustness; the harness ignores unknown ids.
+        "notifications/initialized" | "initialized" => rpc_result(id, json!({})),
+        // Een client breekt een lopende aanroep af (#575): alleen opdrachten
+        // van extensies zijn af te breken; die krijgen hun AbortSignal.
+        "notifications/cancelled" => {
+            let request_id = body.get("params").and_then(|p| p.get("requestId")).cloned();
+            if let (Some(_), Some(rid)) = (&state.app_handle, request_id) {
+                let st = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = tool_app_request(&st, "mcp:cancel-extension-command", &json!({ "rpcId": rid }), Duration::from_secs(5)).await;
+                });
+            }
+            rpc_result(id, json!({}))
+        }
+        other => rpc_error(
+            id,
+            jsonrpc_error::METHOD_NOT_FOUND,
+            format!("method not found: {other}"),
+        ),
+    };
+
+    (StatusCode::OK, Json(response))
+}
+
+/// Start the MCP server. This is an async function that runs forever (until
+/// the binding errors or the process exits). Callers should `tauri::async_
+/// runtime::spawn` it from `lib::run` so the Tauri event loop continues.
+///
+/// In release builds, the server refuses to start unless `OPS_ENABLE_MCP=1`
+/// is set in the environment.
+pub async fn start(
+    port: u16,
+    test_pdfs_dir: PathBuf,
+    app_handle: Option<AppHandle>,
+) -> Result<(), String> {
+    if !cfg!(debug_assertions) && std::env::var("OPS_ENABLE_MCP").as_deref() != Ok("1") {
+        return Err(
+            "MCP server refused to start: release build without OPS_ENABLE_MCP=1".into(),
+        );
+    }
+
+    let state = AppState {
+        test_pdfs_dir: Arc::new(test_pdfs_dir),
+        app_handle,
+        profiel: Profiel::Ontwikkeling,
+        poort: port,
+        toegang: Toegang::Lokaal,
+    };
+
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|e: std::net::AddrParseError| format!("bad addr: {e}"))?;
+
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| format!("bind {addr}: {e}"))?;
+
+    eprintln!("MCP server listening on http://127.0.0.1:{port}/mcp");
+    crate::mcp_koppeling::markeer_startvlag(port);
+    if let Some(app) = state.app_handle.as_ref() {
+        crate::mcp_signaal::meld_status(app, &crate::mcp_koppeling::mcp_status());
+    }
+
+    serveer(listener, state, None).await
+}
+
+/// OpenAEC Linux (#863): de server uit `OPENAEC_MCP_POORT`/`OPENAEC_MCP_GEHEIM`
+/// (openaec_omgeving.rs). Publiek profiel, zoals de instelling in de app; het
+/// geheim is de toestemming, dus geen `OPS_ENABLE_MCP`.
+pub async fn start_beheerd(
+    instelling: crate::openaec_omgeving::McpInstelling,
+    app_handle: Option<AppHandle>,
+) -> Result<(), String> {
+    let adres = instelling.adres;
+    let listener = tokio::net::TcpListener::bind(adres)
+        .await
+        .map_err(|e| format!("bind {adres}: {e}"))?;
+    let mut state = AppState::nieuw(Profiel::Publiek, adres.port(), app_handle);
+    state.toegang = Toegang::Geheim(Arc::from(instelling.geheim.as_str()));
+    eprintln!("MCP server (OPENAEC_MCP_POORT) listening on http://{adres}/mcp");
+    crate::mcp_koppeling::markeer_omgeving(adres.port());
+    serveer(listener, state, None).await
+}
+
+/// Serveert `/mcp` op een al gebonden listener. Met `stop` stopt de server
+/// netjes zodra dat signaal komt (de instelling in de app gaat uit).
+pub async fn serveer(
+    listener: tokio::net::TcpListener,
+    state: AppState,
+    stop: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<(), String> {
+    let app = Router::new()
+        .route("/mcp", post(mcp_handler))
+        .with_state(state);
+    let serve = axum::serve(listener, app);
+    match stop {
+        Some(rx) => serve.with_graceful_shutdown(async { let _ = rx.await; }).await,
+        None => serve.await,
+    }
+    .map_err(|e| format!("MCP server error: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn beheerde_server_wil_het_geheim_en_geen_browser() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let kop = |paren: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in paren {
+                h.insert(*k, HeaderValue::from_static(v));
+            }
+            h
+        };
+        let geheim = "0123456789abcdef";
+        let goed = [("host", "ops-container:9300"), ("authorization", "Bearer 0123456789abcdef")];
+        assert!(beheerd_verzoek_toegestaan(&kop(&goed), geheim));
+        assert!(beheerd_verzoek_toegestaan(&kop(&[("authorization", "bearer 0123456789abcdef")]), geheim));
+        assert!(!beheerd_verzoek_toegestaan(&kop(&[]), geheim), "zonder geheim");
+        assert!(!beheerd_verzoek_toegestaan(&kop(&[("authorization", "Bearer 0123456789abcdeX")]), geheim));
+        assert!(!beheerd_verzoek_toegestaan(&kop(&[("authorization", "Bearer 0123456789abcdef0")]), geheim));
+        assert!(!beheerd_verzoek_toegestaan(&kop(&[("authorization", "Basic 0123456789abcdef")]), geheim));
+        assert!(!beheerd_verzoek_toegestaan(&kop(&[("authorization", "0123456789abcdef")]), geheim));
+        // Een browser stuurt altijd Origin mee, ook met het juiste geheim.
+        let browser = [("authorization", "Bearer 0123456789abcdef"), ("origin", "http://localhost:3000")];
+        assert!(!beheerd_verzoek_toegestaan(&kop(&browser), geheim));
+        assert!(!beheerd_verzoek_toegestaan(&kop(&[("authorization", "Bearer ")]), ""), "leeg geheim nooit");
+
+        let mut state = AppState::nieuw(Profiel::Publiek, 9300, None);
+        state.toegang = Toegang::Geheim(Arc::from(geheim));
+        assert!(toegang_toegestaan(&kop(&goed), &state));
+        assert!(!toegang_toegestaan(&kop(&[("host", "127.0.0.1:9300")]), &state), "lokaal zonder geheim");
+        let lokaal = AppState::nieuw(Profiel::Publiek, 9300, None);
+        assert!(toegang_toegestaan(&kop(&[("host", "127.0.0.1:9300")]), &lokaal));
+        assert!(!toegang_toegestaan(&kop(&goed), &lokaal), "andere host blijft geweigerd");
+    }
+
+    #[test]
+    fn alleen_lokale_verzoeken_worden_toegelaten() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let kop = |paren: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in paren {
+                h.insert(*k, HeaderValue::from_static(v));
+            }
+            h
+        };
+        assert!(verzoek_toegestaan(&kop(&[("host", "127.0.0.1:9223")]), 9223));
+        assert!(verzoek_toegestaan(&kop(&[("host", "localhost:9223")]), 9223));
+        assert!(verzoek_toegestaan(&kop(&[]), 9223));
+        assert!(verzoek_toegestaan(&kop(&[("host", "127.0.0.1:9223"), ("origin", "http://localhost:6274")]), 9223));
+        assert!(!verzoek_toegestaan(&kop(&[("host", "evil.example:9223")]), 9223), "DNS-rebinding");
+        assert!(!verzoek_toegestaan(&kop(&[("host", "127.0.0.1:9223"), ("origin", "https://evil.example")]), 9223), "website");
+        assert!(!verzoek_toegestaan(&kop(&[("host", "127.0.0.1:9999")]), 9223));
+    }
+
+    #[test]
+    fn elk_gereedschap_staat_in_de_metatabel_en_omgekeerd() {
+        let v = handle_tools_list();
+        let namen: Vec<String> = v["tools"].as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        for n in &namen {
+            assert!(crate::mcp_tool_meta::meta(n).is_some(), "{n} ontbreekt in mcp_tool_meta.rs");
+        }
+        for m in crate::mcp_tool_meta::TOOLS {
+            assert!(namen.iter().any(|n| n == m.naam), "{} staat in de tabel maar bestaat niet", m.naam);
+        }
+    }
+
+    #[test]
+    fn publieke_catalogus_is_gelijk_aan_verpakte_tools() {
+        let publiek = tools_list_voor(Profiel::Publiek);
+        let verpakt: Value = serde_json::from_str(include_str!("../../../mcp-stdio/tools.json"))
+            .expect("valid packaged MCP catalog");
+        assert_eq!(publiek["tools"], verpakt, "native and stdio schemas/metadata/order must match");
+    }
+
+    #[test]
+    fn publiek_profiel_laat_ontwikkelgereedschap_weg_en_annoteert_alles() {
+        use crate::mcp_tool_meta::Profiel;
+        let publiek = tools_list_voor(Profiel::Publiek);
+        let arr = publiek["tools"].as_array().unwrap();
+        assert_eq!(arr.len(), 94);
+        for t in arr {
+            let a = &t["annotations"];
+            assert!(a["title"].as_str().map_or(false, |s| !s.is_empty()), "{} zonder titel", t["name"]);
+            assert!(a["readOnlyHint"].is_boolean() && a["destructiveHint"].is_boolean(), "{} zonder hints", t["name"]);
+            assert_eq!(a["openWorldHint"], false);
+        }
+        for dev in ["app_get_recent_console", "list_test_pdfs", "app_accounts_fetch"] {
+            assert!(!arr.iter().any(|t| t["name"] == dev), "{dev} hoort niet in het publieke profiel");
+        }
+        let alles = tools_list_voor(Profiel::Ontwikkeling);
+        assert_eq!(
+            alles["tools"].as_array().unwrap().len(),
+            handle_tools_list()["tools"].as_array().unwrap().len()
+        );
+    }
+
+    #[test]
+    fn tools_json_van_de_brug_is_actueel() {
+        use crate::mcp_tool_meta::Profiel;
+        let pad = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..").join("mcp-stdio").join("tools.json");
+        let verwacht = tools_list_voor(Profiel::Publiek)["tools"].clone();
+        if std::env::var("OPDS_MCPB_TOOLS_SCHRIJVEN").as_deref() == Ok("1") {
+            std::fs::write(&pad, serde_json::to_string_pretty(&verwacht).unwrap() + "\n").unwrap();
+        }
+        let op_schijf: Value = serde_json::from_str(
+            &std::fs::read_to_string(&pad)
+                .expect("mcp-stdio/tools.json ontbreekt - draai met OPDS_MCPB_TOOLS_SCHRIJVEN=1"),
+        )
+        .unwrap();
+        assert_eq!(op_schijf, verwacht, "mcp-stdio/tools.json loopt achter - draai met OPDS_MCPB_TOOLS_SCHRIJVEN=1");
+    }
+
+    #[test]
+    fn annotatielagen_zijn_te_bedienen_via_mcp() {
+        let v = handle_tools_list();
+        let zoek = |naam: &str| {
+            v["tools"].as_array().unwrap().iter()
+                .find(|t| t["name"] == naam)
+                .unwrap_or_else(|| panic!("{naam} staat in de lijst"))
+                .clone()
+        };
+        assert_eq!(zoek("app_create_layer")["inputSchema"]["required"], json!(["name"]));
+        assert_eq!(zoek("app_set_layer")["inputSchema"]["required"], json!(["layer"]));
+        for naam in ["app_create_annotation", "app_update_annotation", "app_list_annotations"] {
+            assert_eq!(zoek(naam)["inputSchema"]["properties"]["layer"]["type"], "string", "{naam} heeft een laag-argument");
+        }
+        use crate::mcp_tool_meta::meta;
+        assert!(meta("app_list_layers").unwrap().alleen_lezen);
+        let maak = meta("app_create_layer").unwrap();
+        assert!(!maak.alleen_lezen && !maak.wijzigt);
+        assert!(meta("app_set_layer").unwrap().wijzigt);
+    }
+
+    #[test]
+    fn extensies_zijn_te_beheren_via_mcp() {
+        let v = handle_tools_list();
+        let zoek = |naam: &str| {
+            v["tools"].as_array().unwrap().iter()
+                .find(|t| t["name"] == naam)
+                .unwrap_or_else(|| panic!("{naam} staat in de lijst"))
+                .clone()
+        };
+        assert_eq!(zoek("app_install_extension")["inputSchema"]["required"], json!(["path", "replace", "idempotencyKey"]));
+        assert_eq!(zoek("app_install_extension")["inputSchema"]["properties"]["replace"]["enum"], json!(["never", "ifNewer", "always"]));
+        assert_eq!(zoek("app_reload_extension")["inputSchema"]["required"], json!(["id"]));
+        assert!(zoek("app_list_commands")["description"].as_str().unwrap().contains("'ext:<extensionId>:<itemId>'"));
+        use crate::mcp_tool_meta::meta;
+        assert!(meta("app_list_extensions").unwrap().alleen_lezen);
+        assert!(meta("app_install_extension").unwrap().wijzigt, "installeren kan een installatie vervangen");
+        let herladen = meta("app_reload_extension").unwrap();
+        assert!(!herladen.alleen_lezen && !herladen.wijzigt);
+    }
+
+    #[test]
+    fn extensieopdrachten_zijn_aan_te_roepen_via_mcp() {
+        let v = handle_tools_list();
+        let tool = v["tools"].as_array().unwrap().iter()
+            .find(|t| t["name"] == "app_call_extension_command")
+            .expect("app_call_extension_command staat in de lijst")
+            .clone();
+        assert_eq!(tool["inputSchema"]["required"], json!(["tool"]));
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert!(tool["description"].as_str().unwrap().contains("ext_<extension>__<command>"));
+        assert!(crate::mcp_tool_meta::meta("app_call_extension_command").unwrap().wijzigt);
+        // Zonder app is er geen extensielijst: alleen de vaste gereedschappen.
+        let state = AppState::nieuw(Profiel::Publiek, 9999, None);
+        assert_eq!(
+            tools_list_met_extensies(&state)["tools"].as_array().unwrap().len(),
+            tools_list_voor(Profiel::Publiek)["tools"].as_array().unwrap().len()
+        );
+        assert!(!extensie_tool_bekend(&state, "ext_a__x"));
+    }
+
+    #[test]
+    fn agenttaken_zijn_te_beantwoorden_via_mcp() {
+        let v = handle_tools_list();
+        let tools = v["tools"].as_array().unwrap();
+        let zoek = |naam: &str| {
+            tools.iter()
+                .find(|t| t["name"] == naam)
+                .unwrap_or_else(|| panic!("{naam} staat in de lijst"))
+                .clone()
+        };
+        let ophalen = zoek("app_agent_task_pending");
+        assert_eq!(ophalen["inputSchema"]["additionalProperties"], false);
+        assert_eq!(ophalen["inputSchema"]["properties"]["kind"]["type"], "string");
+        assert!(ophalen["inputSchema"].get("required").is_none());
+        let antwoord = zoek("app_agent_task_result");
+        assert_eq!(antwoord["inputSchema"]["required"], json!(["id"]));
+        assert_eq!(antwoord["inputSchema"]["properties"]["error"]["required"], json!(["message"]));
+        assert_eq!(antwoord["inputSchema"]["properties"]["error"]["additionalProperties"], false);
+        // Direct na de accountgereedschappen, in deze volgorde.
+        let pos = |naam: &str| tools.iter().position(|t| t["name"] == naam).unwrap();
+        assert_eq!(pos("app_agent_task_pending"), pos("app_accounts_fetch") + 1);
+        assert_eq!(pos("app_agent_task_result"), pos("app_agent_task_pending") + 1);
+        use crate::mcp_tool_meta::{beschikbaar, meta, Profiel};
+        for naam in ["app_agent_task_pending", "app_agent_task_result"] {
+            let m = meta(naam).unwrap();
+            assert!(!m.alleen_lezen && !m.wijzigt, "{naam}: wijzigt geen documentgegevens");
+            assert!(beschikbaar(naam, Profiel::Publiek), "{naam} hoort in het publieke profiel");
+        }
+    }
+
+    #[test]
+    fn interface_is_te_lezen_via_mcp() {
+        let v = handle_tools_list();
+        let tools = v["tools"].as_array().unwrap();
+        let lezen = tools.iter().find(|t| t["name"] == "app_read_ui").expect("app_read_ui staat in de lijst");
+        let schema = &lezen["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema.get("required").is_none(), "zonder argumenten leest hij de standaardgebieden");
+        assert_eq!(schema["properties"]["maxNodes"]["maximum"], 3000);
+        assert_eq!(schema["properties"]["includeHidden"]["type"], "boolean");
+        assert!(crate::mcp_tool_meta::meta("app_read_ui").unwrap().alleen_lezen);
+        // Direct na app_run_command, in dezelfde volgorde als de brug en tools.json.
+        let namen: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let i = namen.iter().position(|n| *n == "app_run_command").unwrap();
+        assert_eq!(namen[i + 1], "app_read_ui");
+        let lijst = tools.iter().find(|t| t["name"] == "app_list_commands").unwrap();
+        assert!(lijst["description"].as_str().unwrap().contains("'ribbon-tab:<tab>'"));
+    }
+
+    #[test]
+    fn app_import_cad_beschrijft_de_import_zonder_venster() {
+        let v = handle_tools_list();
+        let tool = v["tools"].as_array().unwrap().iter()
+            .find(|t| t["name"] == "app_import_cad")
+            .expect("app_import_cad staat in de lijst");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["path"]));
+        let props = schema["properties"].as_object().unwrap();
+        for naam in [
+            "path", "space", "scale", "paper", "orientation", "marginMm", "placement", "rotation", "units",
+            "layersOff", "layersOn", "target", "opacity", "colors", "hatch", "text", "xrefs", "images", "searchPaths",
+        ] {
+            assert!(props.contains_key(naam), "{naam} ontbreekt in het schema");
+        }
+        // De opdracht maakt altijd de echte PDF en kiest zelf waar die komt.
+        for naam in ["preview", "outputPath"] {
+            assert!(!props.contains_key(naam), "{naam} hoort niet in het schema");
+        }
+        assert_eq!(props["target"]["enum"], json!(["new", "append", "underlay"]));
+        for (naam, p) in props {
+            assert!(p["type"].is_string(), "{naam} zonder type");
+        }
+        // Voegt iets toe, wijzigt niets bestaands; ook in het publieke profiel.
+        let m = crate::mcp_tool_meta::meta("app_import_cad").unwrap();
+        assert!(!m.alleen_lezen && !m.wijzigt);
+        let publiek = tools_list_voor(crate::mcp_tool_meta::Profiel::Publiek);
+        assert!(publiek["tools"].as_array().unwrap().iter().any(|t| t["name"] == "app_import_cad"));
+    }
+
+    #[test]
+    fn app_export_cad_beschrijft_de_export_zonder_venster() {
+        let v = handle_tools_list();
+        let tool = v["tools"].as_array().unwrap().iter()
+            .find(|t| t["name"] == "app_export_cad")
+            .expect("app_export_cad staat in de lijst");
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["path"]));
+        let props = schema["properties"].as_object().unwrap();
+        for naam in ["path", "pages", "format", "origin", "area", "annotations", "scaleMode", "scale", "layers", "units", "layersOff", "allowLarge"] {
+            assert!(props.contains_key(naam), "{naam} ontbreekt in het schema");
+        }
+        assert_eq!(props["origin"]["enum"], json!(["page", "area", "model"]));
+        assert_eq!(props["format"]["enum"], json!(["dxf", "dxf_binary", "dwg"]));
+        for (naam, p) in props {
+            assert!(p["type"].is_string(), "{naam} zonder type");
+        }
+        // Schrijft een bestand: wijzigt, en staat in het publieke profiel.
+        let m = crate::mcp_tool_meta::meta("app_export_cad").unwrap();
+        assert!(!m.alleen_lezen && m.wijzigt);
+        let publiek = tools_list_voor(crate::mcp_tool_meta::Profiel::Publiek);
+        assert!(publiek["tools"].as_array().unwrap().iter().any(|t| t["name"] == "app_export_cad"));
+    }
+
+    #[test]
+    fn app_export_ifcx_beschrijft_de_beta_export() {
+        let v = handle_tools_list();
+        let tool = v["tools"].as_array().unwrap().iter()
+            .find(|t| t["name"] == "app_export_ifcx")
+            .expect("app_export_ifcx staat in de lijst");
+        assert!(tool["description"].as_str().unwrap().contains("(beta;"));
+        let schema = &tool["inputSchema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["path"]));
+        let props = schema["properties"].as_object().unwrap();
+        for naam in ["path", "pages", "raster", "text", "annotations", "maxPathsPerPage"] {
+            assert!(props.contains_key(naam), "{naam} ontbreekt in het schema");
+        }
+        let m = crate::mcp_tool_meta::meta("app_export_ifcx").unwrap();
+        assert!(!m.alleen_lezen && m.wijzigt);
+    }
+
+    #[test]
+    fn printgereedschappen_beschrijven_het_afdrukken_zonder_venster() {
+        let v = handle_tools_list();
+        let zoek = |naam: &str| {
+            v["tools"].as_array().unwrap().iter()
+                .find(|t| t["name"] == naam)
+                .unwrap_or_else(|| panic!("{naam} staat in de lijst"))
+                .clone()
+        };
+
+        let bestand = zoek("app_print_to_pdf");
+        assert_eq!(bestand["inputSchema"]["required"], json!(["path"]));
+        let printer = zoek("app_print");
+        assert_eq!(printer["inputSchema"]["required"], json!(["printer"]));
+        for tool in [&bestand, &printer] {
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["additionalProperties"], false);
+            let props = schema["properties"].as_object().unwrap();
+            for naam in ["pages", "paper", "orientation", "autoRotate", "scaling", "zoom", "center", "content"] {
+                assert!(props.contains_key(naam), "{naam} ontbreekt in {}", tool["name"]);
+            }
+            for (naam, p) in props {
+                assert!(p["type"].is_string(), "{naam} zonder type");
+            }
+            assert_eq!(props["scaling"]["enum"], json!(["fit", "shrink", "actual", "custom-scale"]));
+            assert_eq!(props["content"]["enum"], json!(["document", "document-and-markups"]));
+            assert_eq!(props["orientation"]["enum"], json!(["auto", "portrait", "landscape"]));
+        }
+        // Het aantal exemplaren hoort bij een printer, het doelbestand niet.
+        let naar_bestand = bestand["inputSchema"]["properties"].as_object().unwrap();
+        let naar_printer = printer["inputSchema"]["properties"].as_object().unwrap();
+        assert!(!naar_bestand.contains_key("copies") && !naar_bestand.contains_key("printer"));
+        assert!(naar_printer.contains_key("copies") && !naar_printer.contains_key("path"));
+        // Elk gereedschap kent één eigen velkeuze; de formaten zijn dezelfde.
+        assert_eq!(naar_bestand["paper"]["enum"][0], "page");
+        assert_eq!(naar_printer["paper"]["enum"][0], "printer");
+        let bestand_formaten = &naar_bestand["paper"]["enum"].as_array().unwrap()[1..];
+        let printer_formaten = &naar_printer["paper"]["enum"].as_array().unwrap()[1..];
+        assert_eq!(bestand_formaten, printer_formaten);
+        assert_eq!(bestand_formaten.len(), PRINT_PAPIERFORMATEN.len());
+
+        // Alleen lezen, en geen argumenten.
+        let lijst = zoek("app_list_printers");
+        assert_eq!(lijst["inputSchema"]["additionalProperties"], false);
+        assert!(lijst["inputSchema"]["properties"].as_object().unwrap().is_empty());
+        assert!(crate::mcp_tool_meta::meta("app_list_printers").unwrap().alleen_lezen);
+        // Afdrukken raakt het document niet, maar schrijft een bestand of laat
+        // papier uit een printer komen: wijzigt, dus Claude vraagt erom.
+        for naam in ["app_print_to_pdf", "app_print"] {
+            let m = crate::mcp_tool_meta::meta(naam).unwrap();
+            assert!(!m.alleen_lezen && m.wijzigt, "{naam} moet als wijzigend gelden");
+        }
+        // Alle drie horen in het publieke profiel.
+        let publiek = tools_list_voor(crate::mcp_tool_meta::Profiel::Publiek);
+        for naam in ["app_print_to_pdf", "app_print", "app_list_printers"] {
+            assert!(publiek["tools"].as_array().unwrap().iter().any(|t| t["name"] == naam), "{naam}");
+        }
+    }
+
+    #[test]
+    fn initialize_response_shape() {
+        let v = handle_initialize();
+        assert_eq!(v["serverInfo"]["name"], "open-pdf-studio");
+        assert_eq!(v["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["capabilities"]["tools"]["listChanged"], false);
+        assert_eq!(v["protocolVersion"], "2025-03-26");
+    }
+
+    #[test]
+    fn tools_list_advertises_list_test_pdfs() {
+        let v = handle_tools_list();
+        let arr = v["tools"].as_array().expect("tools must be an array");
+        assert!(
+            arr.iter().any(|t| t["name"] == "list_test_pdfs"),
+            "tools list must advertise list_test_pdfs, got: {arr:?}"
+        );
+        let tool = arr
+            .iter()
+            .find(|t| t["name"] == "list_test_pdfs")
+            .expect("descriptor present");
+        assert_eq!(tool["inputSchema"]["type"], "object");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn resolve_test_pdfs_dir_prefers_explicit_override() {
+        let fixture = PathBuf::from("render-fixtures");
+        assert_eq!(resolve_test_pdfs_dir(Some(fixture.clone())), fixture);
+    }
+
+    #[test]
+    fn resolve_test_pdfs_dir_defaults_to_repository_corpus() {
+        let expected = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("test pdf-bestanden")
+            .join("Originele bestanden");
+
+        assert_eq!(resolve_test_pdfs_dir(None), expected);
+    }
+
+    /// Exercises the real `tool_list_test_pdfs` over a fixture directory.
+    /// We point `AppState.test_pdfs_dir` at the repo's actual test corpus
+    /// (`../../test pdf-bestanden/Originele bestanden`) so this also serves
+    /// as a smoke test when the GUI binary cannot be launched.
+    #[test]
+    fn tool_list_test_pdfs_returns_corpus_entries() {
+        // Resolve corpus relative to this crate's manifest dir so the test is
+        // CWD-independent.
+        let corpus = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("test pdf-bestanden")
+            .join("Originele bestanden");
+        if !corpus.is_dir() {
+            // Skip gracefully if the corpus isn't checked in on this clone.
+            eprintln!("skipping: corpus dir not found at {:?}", corpus);
+            return;
+        }
+
+        let state = AppState {
+            test_pdfs_dir: Arc::new(corpus),
+            app_handle: None,
+            profiel: Profiel::Ontwikkeling,
+            poort: 9223,
+            toegang: Toegang::Lokaal,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let value = rt
+            .block_on(tool_list_test_pdfs(&state))
+            .expect("tool_list_test_pdfs ok");
+
+        assert_eq!(value["isError"], false);
+        let text = value["content"][0]["text"]
+            .as_str()
+            .expect("text content present");
+        let payload: Value =
+            serde_json::from_str(text).expect("text payload is valid JSON");
+        let pdfs = payload["pdfs"].as_array().expect("pdfs is an array");
+        assert!(
+            !pdfs.is_empty(),
+            "expected at least one PDF in the corpus, got payload {payload}"
+        );
+        for entry in pdfs {
+            assert!(entry["path"].is_string(), "path is string");
+            assert!(entry["file_size"].is_u64(), "file_size is unsigned int");
+            assert!(
+                entry["page_count"].as_u64().unwrap_or(0) > 0,
+                "page_count > 0 for {}",
+                entry["path"]
+            );
+        }
+    }
+
+    #[test]
+    fn tools_list_advertises_screenshot_page() {
+        let v = handle_tools_list();
+        let arr = v["tools"].as_array().expect("tools must be an array");
+        let tool = arr
+            .iter()
+            .find(|t| t["name"] == "screenshot_page")
+            .expect("screenshot_page descriptor present");
+        assert_eq!(tool["inputSchema"]["type"], "object");
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .expect("required is array");
+        let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"path"));
+        assert!(names.contains(&"page_index"));
+    }
+
+    #[tokio::test]
+    async fn tool_screenshot_page_returns_png_base64() {
+        use std::path::PathBuf;
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // CARGO_MANIFEST_DIR is `<repo>/open-pdf-studio/src-tauri`. The corpus
+        // sits at `<repo>/test pdf-bestanden/Originele bestanden/`.
+        let corpus = manifest_dir
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join("test pdf-bestanden")
+            .join("Originele bestanden");
+        if !corpus.exists() {
+            eprintln!("[skip] corpus dir missing at {:?}", corpus);
+            return;
+        }
+        // Pick the smallest PDF deterministically.
+        let mut pdfs: Vec<_> = std::fs::read_dir(&corpus).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("pdf"))
+            .collect();
+        pdfs.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX));
+        let smallest = pdfs.first().expect("no pdfs in corpus").clone();
+
+        let state = AppState { test_pdfs_dir: std::sync::Arc::new(corpus), app_handle: None, profiel: Profiel::Ontwikkeling, poort: 9223, toegang: Toegang::Lokaal };
+        let args = serde_json::json!({
+            "path": smallest.to_string_lossy(),
+            "page_index": 0,
+            "width": 200
+        });
+        let result = tool_screenshot_page(&state, &args).await.expect("render ok");
+        assert_eq!(result["isError"], serde_json::Value::Bool(false));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let b64 = body["png_base64"].as_str().unwrap();
+        assert!(b64.starts_with("iVBORw0KGgo"), "expected png magic; got {}", &b64[..20]);
+        assert!(body["width"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn tools_list_advertises_get_pdf_metadata() {
+        let v = handle_tools_list();
+        let names: Vec<&str> = v["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"get_pdf_metadata"));
+    }
+
+    #[tokio::test]
+    async fn tool_get_pdf_metadata_returns_version_and_pages() {
+        use std::path::PathBuf;
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let corpus = manifest_dir
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join("test pdf-bestanden")
+            .join("Originele bestanden");
+        if !corpus.exists() {
+            eprintln!("[skip] corpus dir missing at {:?}", corpus);
+            return;
+        }
+        // Pick "Technische tekening.pdf" — a known /Rotate=90 file with multi-page content.
+        let pdf = corpus.join("Technische tekening.pdf");
+        if !pdf.exists() {
+            eprintln!("[skip] expected test pdf missing: {:?}", pdf);
+            return;
+        }
+
+        let state = AppState {
+            test_pdfs_dir: std::sync::Arc::new(corpus),
+            app_handle: None,
+            profiel: Profiel::Ontwikkeling,
+            poort: 9223,
+            toegang: Toegang::Lokaal,
+        };
+        let args = serde_json::json!({ "path": pdf.to_string_lossy() });
+        let result = tool_get_pdf_metadata(&state, &args).await.expect("metadata ok");
+        assert_eq!(result["isError"], serde_json::Value::Bool(false));
+
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(body["pdf_version"].as_str().unwrap().starts_with("1."));
+        let page_count = body["page_count"].as_u64().unwrap();
+        assert!(page_count >= 1, "expected at least 1 page");
+        let pages = body["pages"].as_array().unwrap();
+        assert_eq!(pages.len() as u64, page_count);
+        // Page 0 of Technische tekening.pdf has /Rotate 90 in the source PDF.
+        let rot0 = pages[0]["rotation"].as_i64().unwrap();
+        assert_eq!(rot0, 90, "Technische tekening.pdf page 0 should have /Rotate 90");
+        let mediabox = pages[0]["mediabox"].as_array().unwrap();
+        assert_eq!(mediabox.len(), 4, "MediaBox should be 4 numbers");
+    }
+
+    #[test]
+    fn tools_list_advertises_screenshot_all() {
+        let v = handle_tools_list();
+        let names: Vec<&str> = v["tools"].as_array().unwrap().iter()
+            .map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"screenshot_all"));
+    }
+
+    #[tokio::test]
+    async fn tool_screenshot_all_renders_every_page() {
+        use std::path::PathBuf;
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let corpus = manifest_dir
+            .ancestors()
+            .nth(2)
+            .unwrap()
+            .join("test pdf-bestanden")
+            .join("Originele bestanden");
+        if !corpus.exists() {
+            eprintln!("[skip] corpus dir missing");
+            return;
+        }
+        // Pick the smallest multi-page-or-one PDF so the test runs fast.
+        let pdfs: Vec<_> = std::fs::read_dir(&corpus).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("pdf"))
+            .collect();
+        let smallest = pdfs.iter()
+            .min_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX))
+            .expect("no pdfs in corpus")
+            .clone();
+
+        let state = AppState { test_pdfs_dir: std::sync::Arc::new(corpus), app_handle: None, profiel: Profiel::Ontwikkeling, poort: 9223, toegang: Toegang::Lokaal };
+        let args = serde_json::json!({
+            "path": smallest.to_string_lossy(),
+            "width": 200
+        });
+        let result = tool_screenshot_all(&state, &args).await.expect("render ok");
+        assert_eq!(result["isError"], serde_json::Value::Bool(false));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let body: serde_json::Value = serde_json::from_str(text).unwrap();
+        let pages = body["pages"].as_array().unwrap();
+        assert!(!pages.is_empty(), "should have at least one page");
+        for (i, p) in pages.iter().enumerate() {
+            assert_eq!(p["index"].as_u64().unwrap(), i as u64);
+            let b64 = p["png_base64"].as_str().unwrap();
+            assert!(b64.starts_with("iVBORw0KGgo"), "page {i} not a valid png");
+            assert!(p["width"].as_u64().unwrap() > 0);
+            assert!(p["height"].as_u64().unwrap() > 0);
+        }
+    }
+
+    /// Confirms every new mouse + keyboard tool is registered with a
+    /// well-formed input schema. Catches drift between the descriptor
+    /// list and the dispatch arms.
+    #[test]
+    fn tools_list_advertises_input_tools() {
+        let v = handle_tools_list();
+        let arr = v["tools"].as_array().expect("tools is an array");
+        let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for tool in [
+            "app_mouse_move",
+            "app_mouse_click",
+            "app_mouse_drag",
+            "app_scroll",
+            "app_key",
+            "app_type",
+        ] {
+            assert!(names.contains(&tool), "missing tool: {tool} (got {names:?})");
+            let descr = arr.iter().find(|t| t["name"] == tool).unwrap();
+            assert_eq!(
+                descr["inputSchema"]["type"], "object",
+                "{tool} schema must be an object"
+            );
+            assert_eq!(
+                descr["inputSchema"]["additionalProperties"], false,
+                "{tool} should reject unknown fields"
+            );
+        }
+    }
+
+    /// Confirms every app-control tool (tools/annotations/tabs/view/scale)
+    /// is registered with a well-formed input schema. Catches drift between
+    /// the descriptor list and the dispatch arms.
+    #[test]
+    fn tools_list_advertises_app_control_tools() {
+        let v = handle_tools_list();
+        let arr = v["tools"].as_array().expect("tools is an array");
+        let names: Vec<&str> = arr.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        for tool in [
+            "app_set_tool",
+            "app_get_current_tool",
+            "app_click_element",
+            "app_ui_state",
+            "app_set_window_size",
+            "app_create_annotation",
+            "app_list_annotations",
+            "app_get_annotation",
+            "app_update_annotation",
+            "app_delete_annotation",
+            "app_select_annotation",
+            "app_clear_selection",
+            "app_undo",
+            "app_redo",
+            "app_list_tabs",
+            "app_switch_tab",
+            "app_close_tab",
+            "app_new_blank_pdf",
+            "app_save_pdf",
+            "app_set_view_mode",
+            "app_fit_page",
+            "app_fit_width",
+            "app_get_page_count",
+            "app_set_measure_scale",
+            "app_get_takeoff",
+            "app_place_schedule",
+            "app_structural_layout",
+            "app_list_commands",
+            "app_run_command",
+            "app_read_ui",
+            "app_snippet_cut",
+            "app_snippet_paste",
+            "app_snippet_flatten",
+            "app_symbol_scale",
+            "app_titleblock",
+            "app_floorplan",
+            "app_facade_element",
+            "app_import_cad",
+            "app_export_cad",
+            "app_export_ifcx",
+            "app_print_to_pdf",
+            "app_print",
+            "app_list_printers",
+            "app_list_layers",
+            "app_create_layer",
+            "app_set_layer",
+            "app_list_system_types",
+            "app_register_system_type",
+            "app_update_system_type",
+            "app_open_system_type_editor",
+            "app_get_system_geometry",
+            "app_list_extensions",
+            "app_install_extension",
+            "app_reload_extension",
+        ] {
+            assert!(names.contains(&tool), "missing tool: {tool} (got {names:?})");
+            let descr = arr.iter().find(|t| t["name"] == tool).unwrap();
+            assert_eq!(
+                descr["inputSchema"]["type"], "object",
+                "{tool} schema must be an object"
+            );
+            assert_eq!(
+                descr["inputSchema"]["additionalProperties"], false,
+                "{tool} should reject unknown fields"
+            );
+        }
+    }
+
+    /// Sanity-check that calling an `app_*` tool without an AppHandle
+    /// returns an error rather than panicking. Same harness pattern as
+    /// the original 5 app_* tools.
+    #[tokio::test]
+    async fn input_tools_without_app_handle_return_error() {
+        let state = AppState {
+            test_pdfs_dir: std::sync::Arc::new(std::path::PathBuf::from(".")),
+            app_handle: None,
+            profiel: Profiel::Ontwikkeling,
+            poort: 9223,
+            toegang: Toegang::Lokaal,
+        };
+        for (name, args) in [
+            ("app_mouse_move",  serde_json::json!({"x": 100, "y": 100})),
+            ("app_mouse_click", serde_json::json!({"x": 100, "y": 100})),
+            ("app_mouse_drag",  serde_json::json!({"x1": 0, "y1": 0, "x2": 1, "y2": 1})),
+            ("app_scroll",      serde_json::json!({"x": 100, "y": 100, "dy": -1})),
+            ("app_key",         serde_json::json!({"key": "Escape"})),
+            ("app_type",        serde_json::json!({"text": "x"})),
+        ] {
+            let params = serde_json::json!({"name": name, "arguments": args});
+            let result = handle_tools_call(&state, &params).await;
+            assert!(result.is_err(), "{name} must return Err without an AppHandle");
+            let (_code, msg) = result.unwrap_err();
+            assert!(
+                msg.contains("AppHandle unavailable"),
+                "{name} message should explain missing AppHandle, got: {msg}"
+            );
+        }
+    }
+}

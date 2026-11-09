@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schemas.tauri.app/config/2",
+  "identifier": "mobile",
+  "description": "Capabilities for the main window on mobile platforms (Android/iOS)",
+  "platforms": ["android", "iOS"],
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-title",
+    "core:window:allow-theme",
+    "core:window:allow-set-theme",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    "dialog:allow-confirm",
+    "fs:read-all",
+    "fs:write-all",
+    "fs:allow-exists",
+    "fs:allow-stat",
+    "shell:allow-open",
+    "store:default",
+    "os:default",
+    "process:allow-restart",
+    "process:allow-exit",
+    "deep-link:default"
+  ]
+}

@@ -1,0 +1,701 @@
+import { For, Show, createSignal, createEffect, onCleanup } from 'solid-js';
+import { activeTab, collapsed } from '../../../stores/leftPanelStore.js';
+import {
+  items, countText, emptyMessage, sortMode, setSortMode, filterMode, setFilterMode, hiddenStatuses, toggleHiddenStatus,
+  collapsedGroups, toggleGroup, expandAllGroups, collapseAllGroups,
+  listFilter, updateListFilter, clearListFilter, anyListFilterActive, filterOptions, filterBarOpen, setFilterBarOpen,
+} from '../../../stores/panels/annotationsStore.js';
+import { useTranslation } from '../../../../i18n/useTranslation.js';
+import { state, clearSelection, getActiveDocument, getAnnotationBounds } from '../../../../core/state.js';
+import { commitAnnotationMutation, deleteAnnotationsWithUndo } from '../../../../annotations/mutations.js';
+import { expandCorrectionGroups } from '../../../../annotations/corrections/model.js';
+import {
+  cutIcon, copyIcon, deleteIcon, flattenIcon, exportIcon, deselectIcon, propertiesIcon
+} from '../../../data/contextMenuIcons.js';
+
+// Menu icons (codicon-style, viewBox 0 0 16 16, fill currentColor)
+const expandAllIcon = `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M15 6v5c0 2.21-1.79 4-4 4H6c-.74 0-1.38-.4-1.73-1H11c1.65 0 3-1.35 3-3V4.27c.6.35 1 .99 1 1.73m-4 7H4c-1.103 0-2-.897-2-2V4c0-1.103.897-2 2-2h7c1.103 0 2 .897 2 2v7c0 1.103-.897 2-2 2m-7-1h7c.551 0 1-.448 1-1V4c0-.551-.449-1-1-1H4c-.551 0-1 .449-1 1v7c0 .552.449 1 1 1m5.5-5H8V5.5a.5.5 0 0 0-1 0V7H5.5a.5.5 0 0 0 0 1H7v1.5a.5.5 0 0 0 1 0V8h1.5a.5.5 0 0 0 0-1"/></svg>`;
+const collapseAllIcon = `<svg viewBox="0 0 16 16" fill="currentColor"><g><path d="M14 4.27c.6.35 1 .99 1 1.73v5c0 2.21-1.79 4-4 4H6c-.74 0-1.38-.4-1.73-1H11c1.65 0 3-1.35 3-3zM9.5 7a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1z"/><path fill-rule="evenodd" clip-rule="evenodd" d="M11 2c1.103 0 2 .897 2 2v7c0 1.103-.897 2-2 2H4c-1.103 0-2-.897-2-2V4c0-1.103.897-2 2-2zM4 3c-.551 0-1 .449-1 1v7c0 .552.449 1 1 1h7c.551 0 1-.448 1-1V4c0-.551-.449-1-1-1z"/></g></svg>`;
+const summarizeIcon = `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M14.5 3a.5.5 0 0 1 .5.5v9a.5.5 0 0 1-.5.5h-13a.5.5 0 0 1-.5-.5v-9a.5.5 0 0 1 .5-.5zM2 4v8h12V4zm1 1h6v1H3zm0 2h10v1H3zm0 2h8v1H3z"/></svg>`;
+const importIcon = `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M14.5 3a.5.5 0 0 1 .5.5v8a.5.5 0 0 1-1 0v-8a.5.5 0 0 1 .5-.5M5.854 8.146a.5.5 0 0 1 0 .708l-4 4a.5.5 0 0 1-.708-.708L4.293 9H11.5a.5.5 0 0 1 0-1H4.293l3.146-3.146a.5.5 0 0 0-.707-.708l-4 4z"/></svg>`;
+const exportCommentsIcon = `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 3a.5.5 0 0 1 .5.5v8a.5.5 0 0 1-1 0v-8a.5.5 0 0 1 .5-.5m8.646.146a.5.5 0 0 1 .707 0l4 4a.5.5 0 0 1 0 .707l-4 4a.5.5 0 0 1-.707-.707L13.293 8H4.5a.5.5 0 0 1 0-1h8.793l-3.146-3.146a.5.5 0 0 1 0-.707z"/></svg>`;
+const groupByIcon = `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M14 2h-3a1 1 0 0 0-1 1v1H8v-.25A.75.75 0 0 0 7.25 3h-1.5a.75.75 0 0 0-.75.75v1.5c0 .413.337.75.75.75h1.5c.413 0 .75-.337.75-.75V5h2v1a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1V3a1 1 0 0 0-1-1M7 5H6V4h1zm7 1h-3V3h3zm0 2h-3a1 1 0 0 0-1 1v1H8v-.25A.75.75 0 0 0 7.25 9h-1.5a.75.75 0 0 0-.75.75v1.5c0 .413.337.75.75.75h1.5c.413 0 .75-.337.75-.75V11h2v1a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1V9a1 1 0 0 0-1-1m-7 3H6v-1h1zm7 1h-3V9h3z"/></svg>`;
+const showIcon = `<svg viewBox="0 0 16 16" fill="currentColor"><path d="M2.984 8.625a.5.5 0 0 1-.612.355c-.431-.114-.355-.611-.355-.611l.018-.062s.026-.084.047-.145a6.7 6.7 0 0 1 1.117-1.982C4.096 5.089 5.605 4 8 4s3.904 1.089 4.802 2.183a6.7 6.7 0 0 1 1.117 1.982a4 4 0 0 1 .06.187l.003.013v.006a.5.5 0 0 1-.966.258l-.008-.025l-.035-.109a5.7 5.7 0 0 0-.945-1.674C11.286 5.912 10.045 5 8 5s-3.285.912-4.028 1.817a5.7 5.7 0 0 0-.945 1.674l-.035.109zM8 7a2.5 2.5 0 1 0 0 5a2.5 2.5 0 0 0 0-5M6.5 9.5a1.5 1.5 0 1 1 3 0a1.5 1.5 0 0 1-3 0"/></svg>`;
+
+const groupOptions = [
+  { key: 'page', label: 'groupByPage' },
+  { key: 'type', label: 'groupByType' },
+  { key: 'modifiedDate', label: 'groupByModifiedDate' },
+  { key: 'creationDate', label: 'groupByCreationDate' },
+  { key: 'author', label: 'groupByAuthor' },
+  { key: 'color', label: 'groupByColor' },
+  { key: 'subject', label: 'groupBySubject' },
+  { key: 'status', label: 'groupByStatus' },
+  { key: 'statusAndAuthor', label: 'groupByStatusAndAuthor' },
+  { key: 'lastStatusAuthor', label: 'groupByLastStatusAuthor' },
+];
+
+// Review-statussen voor het Tonen > Status-filter (#236). Sleutels in
+// kleine letters — de filtering in annotations-list.js vergelijkt
+// hoofdletter-ongevoelig. Labels komen uit de bestaande context-namespace.
+const statusFilterOptions = [
+  { key: 'none', label: 'annotation.statusNone' },
+  { key: 'accepted', label: 'annotation.statusAccepted' },
+  { key: 'cancelled', label: 'annotation.statusCancelled' },
+  { key: 'completed', label: 'annotation.statusCompleted' },
+  { key: 'rejected', label: 'annotation.statusRejected' },
+];
+
+export default function AnnotationsPanel() {
+  const { t } = useTranslation('properties');
+  const { t: tCommon } = useTranslation('common');
+  const { t: tContext } = useTranslation('context');
+
+  // The list is not built while it is hidden (annotations-list.js, #491):
+  // bring it up to date the moment it is shown, whichever way that happens
+  // (tab switch, expanding the panel, the ribbon).
+  createEffect(() => {
+    if (activeTab() === 'annotations' && !collapsed()) {
+      import('../../../../ui/panels/annotations-list.js').then(m => m.refreshAnnotationsListIfStale());
+    }
+  });
+
+  const [menuOpen, setMenuOpen] = createSignal(false);
+  const [menuPos, setMenuPos] = createSignal({ top: 0, left: 0 });
+  let menuRef;
+  let menuBtnRef;
+
+  const closeMenu = (e) => {
+    if (menuRef && !menuRef.contains(e.target) && menuBtnRef && !menuBtnRef.contains(e.target)) {
+      setMenuOpen(false);
+    }
+  };
+
+  document.addEventListener('mousedown', closeMenu);
+  onCleanup(() => document.removeEventListener('mousedown', closeMenu));
+
+  const closeAndRun = (fn) => {
+    setMenuOpen(false);
+    fn();
+  };
+
+  const applyFilter = (value) => {
+    setFilterMode(value);
+    import('../../../../ui/panels/annotations-list.js').then(m => m.updateAnnotationsList(value));
+    setMenuOpen(false);
+  };
+
+  // Status aan/uit zetten sluit het menu bewust NIET, zodat meerdere
+  // statussen achter elkaar (de)geselecteerd kunnen worden (#236).
+  const toggleStatusFilter = (statusKey) => {
+    toggleHiddenStatus(statusKey);
+    import('../../../../ui/panels/annotations-list.js').then(m => m.updateAnnotationsList());
+  };
+
+  const applySort = (value) => {
+    setSortMode(value);
+    import('../../../../ui/panels/annotations-list.js').then(m => m.updateAnnotationsList());
+    setMenuOpen(false);
+  };
+
+  const expandAll = () => expandAllGroups();
+
+  const collapseAll = () => {
+    const allKeys = items().filter(i => i.isHeader).map(i => i.groupKey);
+    collapseAllGroups(allKeys);
+  };
+
+  const hasSelection = () => !!state.documents[state.activeDocumentIndex]?.selectedAnnotation;
+  const hasDocument = () => !!state.documents[state.activeDocumentIndex];
+  const hasAnnotations = () => (state.documents[state.activeDocumentIndex]?.annotations?.length || 0) > 0;
+  const hasListRows = () => items().some(i => !i.isHeader);
+
+  // Opmerkingen importeren/exporteren vanuit het paneel (#383): dezelfde
+  // XFDF-routines als het app-menu.
+  const importComments = () => {
+    import('../../../../annotations/xfdf.js').then(m => m.importXFDFFromFile());
+  };
+
+  const exportComments = () => {
+    import('../../../../annotations/xfdf.js').then(m => m.exportXFDFToFile());
+  };
+
+  // Alleen de selectie (een vervanging in haar geheel), in documentvolgorde.
+  const exportSelectedComments = async () => {
+    const doc = getActiveDocument();
+    if (!doc) return;
+    const selectie = doc.selectedAnnotations?.length ? doc.selectedAnnotations
+      : (doc.selectedAnnotation ? [doc.selectedAnnotation] : []);
+    const [{ geselecteerdVoorExport }, { exportXFDFToFile }] = await Promise.all([
+      import('../../../../annotations/opmerkingen-export.js'),
+      import('../../../../annotations/xfdf.js'),
+    ]);
+    const anns = geselecteerdVoorExport(doc.annotations, selectie);
+    if (anns.length > 0) exportXFDFToFile({ annotations: anns, suffix: '-selection' });
+  };
+
+  // De lijst zoals het paneel haar toont (filter, groepering, sortering) als
+  // CSV met alle velden (#383), UTF-8 met BOM.
+  const exportListCsv = async () => {
+    const doc = getActiveDocument();
+    if (!doc) return;
+    const [exp, helpers, lagen, platform, statusBar, i18n] = await Promise.all([
+      import('../../../../annotations/opmerkingen-export.js'),
+      import('../../../../utils/helpers.js'),
+      import('../../../../annotations/annotatie-lagen.js'),
+      import('../../../../core/platform.js'),
+      import('../../../../ui/chrome/status-bar.js'),
+      import('../../../../i18n/config.js'),
+    ]);
+    const i18next = i18n.default;
+    const anns = exp.opmerkingenInLijstvolgorde(items(), doc.annotations);
+    if (anns.length === 0) return;
+    const byId = new Map(doc.annotations.map(a => [a.id, a]));
+    const standaardLaag = i18next.t('annotationLayers.defaultName', { ns: 'ribbon' });
+    const namen = {
+      typeNaam: (a) => helpers.getAnnotationDisplayName(a, byId),
+      statusNaam: (s) => {
+        const hoofd = s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+        return i18next.t(`annotation.status${hoofd}`, { ns: 'context', defaultValue: hoofd });
+      },
+      laagNaam: (a) => lagen.layerDisplayName(lagen.layerOf(doc, a), standaardLaag),
+      omhullende: (a) => getAnnotationBounds(a),
+    };
+    const koppen = exp.CSV_KOLOMMEN.map(k => i18next.t(`leftPanel.csv${k.charAt(0).toUpperCase()}${k.slice(1)}`, { ns: 'properties' }));
+    const csv = exp.bouwCsv(koppen, anns.map(a => exp.opmerkingRij(a, namen)));
+    const baseName = doc.filePath ? doc.filePath.replace(/\.pdf$/i, '') : 'annotations';
+    const pad = await platform.saveFileDialog(baseName + '-comments.csv', [{ name: 'CSV', extensions: ['csv'] }]);
+    if (!pad) return;
+    await platform.writeBinaryFile(pad, new TextEncoder().encode(csv));
+    statusBar.updateStatusMessage(i18next.t('leftPanel.listExported', { ns: 'properties' }));
+  };
+
+  // Opmerkingen samenvatten (#383): de lijst zoals het paneel haar toont als
+  // PDF-rapport met per opmerking een uitsnede van haar plek.
+  const exportSummaryPdf = async () => {
+    const doc = getActiveDocument();
+    if (!doc) return;
+    const [exp, summary] = await Promise.all([
+      import('../../../../annotations/opmerkingen-export.js'),
+      import('../../../../ui/panels/annotations-summary.js'),
+    ]);
+    const anns = exp.opmerkingenInLijstvolgorde(items(), doc.annotations);
+    if (anns.length > 0) await summary.exportAnnotationsSummaryPdf(anns);
+  };
+
+  // Status van veel opmerkingen tegelijk (#383): de selectie, of alles wat
+  // de lijst nu toont (na filters). Eén ongedaan-stap.
+  const selectedAnnotations = () => {
+    const doc = getActiveDocument();
+    if (!doc) return [];
+    return doc.selectedAnnotations?.length ? doc.selectedAnnotations
+      : (doc.selectedAnnotation ? [doc.selectedAnnotation] : []);
+  };
+
+  const setStatusBulk = async (bron, status) => {
+    const doc = getActiveDocument();
+    if (!doc) return;
+    const [exp, summary, rendering, list] = await Promise.all([
+      import('../../../../annotations/opmerkingen-export.js'),
+      import('../../../../ui/panels/annotations-summary.js'),
+      import('../../../../annotations/rendering.js'),
+      import('../../../../ui/panels/annotations-list.js'),
+    ]);
+    const anns = bron === 'selection' ? selectedAnnotations() : exp.opmerkingenInLijstvolgorde(items(), doc.annotations);
+    if (summary.setStatusOfAnnotations(anns, status) === 0) return;
+    if (doc.viewMode === 'continuous') rendering.redrawContinuous();
+    else rendering.redrawAnnotations();
+    list.updateAnnotationsList();
+    if (doc.selectedAnnotation && anns.includes(doc.selectedAnnotation)) {
+      const props = await import('../../../../ui/panels/properties-panel.js');
+      if (selectedAnnotations().length > 1) props.showMultiSelectionProperties();
+      else props.showProperties(doc.selectedAnnotation);
+    }
+  };
+
+  // Filterbalk (#383): auteur, soort, pagina's en datum, over alle pagina's.
+  const refreshList = () => import('../../../../ui/panels/annotations-list.js').then(m => m.updateAnnotationsList());
+  const setListFilter = (patch) => {
+    updateListFilter(patch);
+    refreshList();
+  };
+  const clearFilters = () => {
+    clearListFilter();
+    for (const key of [...hiddenStatuses()]) toggleHiddenStatus(key);
+    refreshList();
+  };
+
+  const cutSelected = () => {
+    const doc = getActiveDocument();
+    const ann = doc?.selectedAnnotation;
+    if (!ann) return;
+    import('../../../../annotations/clipboard.js').then(({ copyAnnotation, copyAnnotations }) => {
+      // Een vervanging (#508) wordt in haar geheel geknipt.
+      const weg = expandCorrectionGroups(doc.annotations, [ann]);
+      // Een vergrendelde andere helft gaat niet ongevraagd mee.
+      if (weg.some(a => a.locked && a !== ann)) return;
+      if (weg.length > 1) copyAnnotations(weg);
+      else copyAnnotation(ann);
+      deleteAnnotationsWithUndo(doc, weg);
+      if (doc) { doc.selectedAnnotation = null; doc.selectedAnnotations = []; }
+      import('../../../../annotations/rendering.js').then(({ redrawAnnotations }) => redrawAnnotations());
+      import('../../../../ui/panels/annotations-list.js').then(m => m.updateAnnotationsList());
+    });
+  };
+
+  const copySelected = () => {
+    const doc = getActiveDocument();
+    const ann = doc?.selectedAnnotation;
+    if (!ann) return;
+    import('../../../../annotations/clipboard.js').then(({ copyAnnotation }) => copyAnnotation(ann));
+  };
+
+  const deleteSelected = async () => {
+    const doc = getActiveDocument();
+    const ann = doc?.selectedAnnotation;
+    if (!ann) return;
+    const { showConfirm } = await import('../../../../ui/chrome/confirm-dialog.js');
+    const confirmed = await showConfirm({
+      title: t('deleteAnnotation.title'),
+      message: t('deleteAnnotation.confirmSingle'),
+      preferenceKey: 'confirmBeforeDelete'
+    });
+    if (confirmed) {
+      // Een vervanging (#508) gaat in haar geheel, met één ongedaan-stap.
+      deleteAnnotationsWithUndo(doc, [ann]);
+      if (doc) { doc.selectedAnnotation = null; doc.selectedAnnotations = []; }
+      import('../../../../annotations/rendering.js').then(({ redrawAnnotations }) => redrawAnnotations());
+      import('../../../../ui/panels/annotations-list.js').then(m => m.updateAnnotationsList());
+    }
+  };
+
+  const flattenSelected = () => {
+    const doc = getActiveDocument();
+    const ann = doc?.selectedAnnotation;
+    if (ann) {
+      commitAnnotationMutation(ann, annotation => { annotation.flattened = true; });
+      import('../../../../annotations/rendering.js').then(({ redrawAnnotations }) => redrawAnnotations());
+    }
+  };
+
+  const deselectAll = () => {
+    clearSelection();
+    import('../../../../ui/panels/annotations-list.js').then(m => m.updateAnnotationsList());
+    import('../../../../annotations/rendering.js').then(({ redrawAnnotations }) => redrawAnnotations());
+  };
+
+  const showProperties = () => {
+    const doc = getActiveDocument();
+    const ann = doc?.selectedAnnotation;
+    if (ann) {
+      import('../../../../ui/panels/properties-panel.js').then(m => m.showProperties(ann));
+    }
+  };
+
+  const headerText = (item) => {
+    if (item.sortMode === 'page') return `${tCommon('page')} ${item.page}`;
+    if (item.sortMode === 'color') return '';
+    return item.headerLabel || '';
+  };
+
+  return (
+    <div class={`left-panel-content${activeTab() === 'annotations' ? ' active' : ''}`} id="annotations-panel">
+      <div class="left-panel-header">
+        <span>{t('leftPanel.annotations')}</span>
+      </div>
+      <div class="annotations-toolbar">
+        <div class="annotations-toolbar-menu-wrapper">
+          <button
+            ref={menuBtnRef}
+            class={`annotations-toolbar-btn${menuOpen() ? ' active' : ''}`}
+            title={t('leftPanel.annotationsMenu')}
+            onClick={() => {
+              if (!menuOpen() && menuBtnRef) {
+                const rect = menuBtnRef.getBoundingClientRect();
+                const isRtl = document.documentElement.dir === 'rtl';
+                if (isRtl) {
+                  setMenuPos({ top: rect.bottom, right: window.innerWidth - rect.right });
+                } else {
+                  setMenuPos({ top: rect.bottom, left: rect.left });
+                }
+              }
+              setMenuOpen(!menuOpen());
+            }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="4" y1="6" x2="20" y2="6"/>
+              <line x1="4" y1="12" x2="20" y2="12"/>
+              <line x1="4" y1="18" x2="20" y2="18"/>
+            </svg>
+          </button>
+          <Show when={menuOpen()}>
+            <div class="annotations-menu" ref={menuRef} style={{
+              top: `${menuPos().top}px`,
+              ...(menuPos().right !== undefined ? { right: `${menuPos().right}px` } : { left: `${menuPos().left}px` })
+            }}>
+              {/* Cut / Copy / Delete / Flatten */}
+              <div
+                class={`annotations-menu-item${!hasSelection() ? ' disabled' : ''}`}
+                onClick={() => hasSelection() && closeAndRun(cutSelected)}
+              >
+                <span class="annotations-menu-icon" innerHTML={cutIcon}></span>
+                <span class="annotations-menu-label">{tCommon('cut')}</span>
+                <span class="annotations-menu-shortcut">Ctrl+X</span>
+              </div>
+              <div
+                class={`annotations-menu-item${!hasSelection() ? ' disabled' : ''}`}
+                onClick={() => hasSelection() && closeAndRun(copySelected)}
+              >
+                <span class="annotations-menu-icon" innerHTML={copyIcon}></span>
+                <span class="annotations-menu-label">{tCommon('copy')}</span>
+                <span class="annotations-menu-shortcut">Ctrl+C</span>
+              </div>
+              <div
+                class={`annotations-menu-item${!hasSelection() ? ' disabled' : ''}`}
+                onClick={() => hasSelection() && closeAndRun(deleteSelected)}
+              >
+                <span class="annotations-menu-icon" innerHTML={deleteIcon}></span>
+                <span class="annotations-menu-label">{tCommon('delete')}</span>
+                <span class="annotations-menu-shortcut">Delete</span>
+              </div>
+              <div
+                class={`annotations-menu-item${!hasSelection() ? ' disabled' : ''}`}
+                onClick={() => hasSelection() && closeAndRun(flattenSelected)}
+              >
+                <span class="annotations-menu-icon" innerHTML={flattenIcon}></span>
+                <span class="annotations-menu-label">{tCommon('flatten')}</span>
+              </div>
+
+              <div class="annotations-menu-separator"></div>
+
+              {/* Expand / Collapse All */}
+              <div class="annotations-menu-item" onClick={() => closeAndRun(expandAll)}>
+                <span class="annotations-menu-icon" innerHTML={expandAllIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.expandAll')}</span>
+              </div>
+              <div class="annotations-menu-item" onClick={() => closeAndRun(collapseAll)}>
+                <span class="annotations-menu-icon" innerHTML={collapseAllIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.collapseAll')}</span>
+              </div>
+
+              <div class="annotations-menu-separator"></div>
+
+              {/* Summarize / Import / Export (#383): samenvatten is het
+                  PDF-rapport van de lijst, met uitsneden. */}
+              <div
+                class={`annotations-menu-item${!hasListRows() ? ' disabled' : ''}`}
+                onClick={() => hasListRows() && closeAndRun(exportSummaryPdf)}
+              >
+                <span class="annotations-menu-icon" innerHTML={summarizeIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.summarize')}</span>
+              </div>
+              <div
+                class={`annotations-menu-item${!hasDocument() ? ' disabled' : ''}`}
+                onClick={() => hasDocument() && closeAndRun(importComments)}
+              >
+                <span class="annotations-menu-icon" innerHTML={importIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.importComments')}</span>
+              </div>
+              <div
+                class={`annotations-menu-item${!hasAnnotations() ? ' disabled' : ''}`}
+                onClick={() => hasAnnotations() && closeAndRun(exportComments)}
+              >
+                <span class="annotations-menu-icon" innerHTML={exportCommentsIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.exportComments')}</span>
+              </div>
+              <div
+                class={`annotations-menu-item${!hasSelection() ? ' disabled' : ''}`}
+                onClick={() => hasSelection() && closeAndRun(exportSelectedComments)}
+              >
+                <span class="annotations-menu-icon" innerHTML={exportCommentsIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.exportSelectedComments')}</span>
+              </div>
+              <div
+                class={`annotations-menu-item${!hasListRows() ? ' disabled' : ''}`}
+                onClick={() => hasListRows() && closeAndRun(exportListCsv)}
+              >
+                <span class="annotations-menu-icon" innerHTML={exportIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.exportListCsv')}</span>
+              </div>
+
+              <div class="annotations-menu-separator"></div>
+
+              {/* Status in bulk (#383) — submenu's */}
+              <div class={`annotations-menu-item annotations-menu-submenu-trigger${!hasSelection() ? ' disabled' : ''}`}>
+                <span class="annotations-menu-icon"></span>
+                <span class="annotations-menu-label">{t('leftPanel.setStatusSelected')}</span>
+                <svg class="annotations-menu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="9 6 15 12 9 18"/>
+                </svg>
+                <Show when={hasSelection()}>
+                  <div class="annotations-submenu">
+                    {statusFilterOptions.map(opt => (
+                      <div class="annotations-menu-item" onClick={() => closeAndRun(() => setStatusBulk('selection', opt.key))}>
+                        <span class="annotations-menu-check"></span>
+                        <span class="annotations-menu-label">{tContext(opt.label)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </Show>
+              </div>
+              <div class={`annotations-menu-item annotations-menu-submenu-trigger${!hasListRows() ? ' disabled' : ''}`}>
+                <span class="annotations-menu-icon"></span>
+                <span class="annotations-menu-label">{t('leftPanel.setStatusListed')}</span>
+                <svg class="annotations-menu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="9 6 15 12 9 18"/>
+                </svg>
+                <Show when={hasListRows()}>
+                  <div class="annotations-submenu">
+                    {statusFilterOptions.map(opt => (
+                      <div class="annotations-menu-item" onClick={() => closeAndRun(() => setStatusBulk('listed', opt.key))}>
+                        <span class="annotations-menu-check"></span>
+                        <span class="annotations-menu-label">{tContext(opt.label)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </Show>
+              </div>
+
+              <div class="annotations-menu-separator"></div>
+
+              {/* Group By — submenu */}
+              <div class="annotations-menu-item annotations-menu-submenu-trigger">
+                <span class="annotations-menu-icon" innerHTML={groupByIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.groupBy')}</span>
+                <svg class="annotations-menu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="9 6 15 12 9 18"/>
+                </svg>
+                <div class="annotations-submenu">
+                  {groupOptions.map(opt => (
+                    <div
+                      class={`annotations-menu-item${sortMode() === opt.key ? ' checked' : ''}`}
+                      onClick={() => applySort(opt.key)}
+                    >
+                      <span class="annotations-menu-check">{sortMode() === opt.key ? '\u2713' : ''}</span>
+                      <span class="annotations-menu-label">{t(`leftPanel.${opt.label}`)}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Show (filter) — submenu */}
+              <div class="annotations-menu-item annotations-menu-submenu-trigger">
+                <span class="annotations-menu-icon" innerHTML={showIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.show')}</span>
+                <svg class="annotations-menu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="9 6 15 12 9 18"/>
+                </svg>
+                <div class="annotations-submenu">
+                  <div
+                    class={`annotations-menu-item${filterMode() === 'all' ? ' checked' : ''}`}
+                    onClick={() => applyFilter('all')}
+                  >
+                    <span class="annotations-menu-check">{filterMode() === 'all' ? '\u2713' : ''}</span>
+                    <span class="annotations-menu-label">{t('leftPanel.allPages')}</span>
+                  </div>
+                  <div
+                    class={`annotations-menu-item${filterMode() === 'current' ? ' checked' : ''}`}
+                    onClick={() => applyFilter('current')}
+                  >
+                    <span class="annotations-menu-check">{filterMode() === 'current' ? '\u2713' : ''}</span>
+                    <span class="annotations-menu-label">{t('leftPanel.currentPage')}</span>
+                  </div>
+
+                  {/* Filter op review-status (#236) \u2014 vinkje = zichtbaar */}
+                  <div class="annotations-menu-separator"></div>
+                  <div class="annotations-menu-section">{tContext('annotation.status')}</div>
+                  {statusFilterOptions.map(opt => (
+                    <div
+                      class={`annotations-menu-item${!hiddenStatuses().has(opt.key) ? ' checked' : ''}`}
+                      onClick={() => toggleStatusFilter(opt.key)}
+                    >
+                      <span class="annotations-menu-check">{!hiddenStatuses().has(opt.key) ? '\u2713' : ''}</span>
+                      <span class="annotations-menu-label">{tContext(opt.label)}</span>
+                    </div>
+                  ))}
+                  <div class="annotations-menu-separator"></div>
+                  <div
+                    class={`annotations-menu-item${filterBarOpen() ? ' checked' : ''}`}
+                    onClick={() => closeAndRun(() => setFilterBarOpen(!filterBarOpen()))}
+                  >
+                    <span class="annotations-menu-check">{filterBarOpen() ? '\u2713' : ''}</span>
+                    <span class="annotations-menu-label">{t('leftPanel.filterBar')}</span>
+                  </div>
+                  <div
+                    class={`annotations-menu-item${!anyListFilterActive() ? ' disabled' : ''}`}
+                    onClick={() => anyListFilterActive() && closeAndRun(clearFilters)}
+                  >
+                    <span class="annotations-menu-check"></span>
+                    <span class="annotations-menu-label">{t('leftPanel.filterClear')}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="annotations-menu-separator"></div>
+
+              {/* Deselect */}
+              <div
+                class={`annotations-menu-item${!hasSelection() ? ' disabled' : ''}`}
+                onClick={() => hasSelection() && closeAndRun(deselectAll)}
+              >
+                <span class="annotations-menu-icon" innerHTML={deselectIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.deselect')}</span>
+              </div>
+
+              <div class="annotations-menu-separator"></div>
+
+              {/* Properties */}
+              <div
+                class={`annotations-menu-item${!hasSelection() ? ' disabled' : ''}`}
+                onClick={() => hasSelection() && closeAndRun(showProperties)}
+              >
+                <span class="annotations-menu-icon" innerHTML={propertiesIcon}></span>
+                <span class="annotations-menu-label">{t('leftPanel.properties')}</span>
+              </div>
+            </div>
+          </Show>
+        </div>
+        <div class="annotations-toolbar-spacer"></div>
+        <button
+          class={`annotations-toolbar-btn${filterBarOpen() || anyListFilterActive() ? ' active' : ''}`}
+          title={t('leftPanel.filterBar')}
+          onClick={() => setFilterBarOpen(!filterBarOpen())}
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <path d="M1.5 2h13a.5.5 0 0 1 .39.81L10 8.93V13.5a.5.5 0 0 1-.28.45l-3 1.5A.5.5 0 0 1 6 15V8.93L1.11 2.81A.5.5 0 0 1 1.5 2m1.04 1L6.89 8.44A.5.5 0 0 1 7 8.75v5.44l2-1V8.75a.5.5 0 0 1 .11-.31L13.46 3z"/>
+          </svg>
+        </button>
+        <button
+          class="annotations-toolbar-btn"
+          title={t('leftPanel.expandAll')}
+          onClick={expandAll}
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <path d="M15 6v5c0 2.21-1.79 4-4 4H6c-.74 0-1.38-.4-1.73-1H11c1.65 0 3-1.35 3-3V4.27c.6.35 1 .99 1 1.73m-4 7H4c-1.103 0-2-.897-2-2V4c0-1.103.897-2 2-2h7c1.103 0 2 .897 2 2v7c0 1.103-.897 2-2 2m-7-1h7c.551 0 1-.448 1-1V4c0-.551-.449-1-1-1H4c-.551 0-1 .449-1 1v7c0 .552.449 1 1 1m5.5-5H8V5.5a.5.5 0 0 0-1 0V7H5.5a.5.5 0 0 0 0 1H7v1.5a.5.5 0 0 0 1 0V8h1.5a.5.5 0 0 0 0-1"/>
+          </svg>
+        </button>
+        <button
+          class="annotations-toolbar-btn"
+          title={t('leftPanel.collapseAll')}
+          onClick={collapseAll}
+        >
+          <svg viewBox="0 0 16 16" fill="currentColor">
+            <g>
+              <path d="M14 4.27c.6.35 1 .99 1 1.73v5c0 2.21-1.79 4-4 4H6c-.74 0-1.38-.4-1.73-1H11c1.65 0 3-1.35 3-3zM9.5 7a.5.5 0 0 1 0 1h-4a.5.5 0 0 1 0-1z"/>
+              <path fill-rule="evenodd" clip-rule="evenodd" d="M11 2c1.103 0 2 .897 2 2v7c0 1.103-.897 2-2 2H4c-1.103 0-2-.897-2-2V4c0-1.103.897-2 2-2zM4 3c-.551 0-1 .449-1 1v7c0 .552.449 1 1 1h7c.551 0 1-.448 1-1V4c0-.551-.449-1-1-1z"/>
+            </g>
+          </svg>
+        </button>
+      </div>
+      <Show when={filterBarOpen()}>
+        <div class="annotations-filter-bar">
+          <label>{t('leftPanel.csvAuthor')}</label>
+          <select value={listFilter().auteur} onChange={(e) => setListFilter({ auteur: e.target.value })}>
+            <option value="">{t('leftPanel.filterAll')}</option>
+            <Show when={listFilter().auteur && !filterOptions().authors.includes(listFilter().auteur)}>
+              <option value={listFilter().auteur}>{listFilter().auteur}</option>
+            </Show>
+            <For each={filterOptions().authors}>{(a) => <option value={a}>{a}</option>}</For>
+          </select>
+          <label>{t('leftPanel.csvType')}</label>
+          <select value={listFilter().type} onChange={(e) => setListFilter({ type: e.target.value })}>
+            <option value="">{t('leftPanel.filterAll')}</option>
+            <Show when={listFilter().type && !filterOptions().types.some(o => o.type === listFilter().type)}>
+              <option value={listFilter().type}>{listFilter().type}</option>
+            </Show>
+            <For each={filterOptions().types}>{(o) => <option value={o.type}>{o.naam}</option>}</For>
+          </select>
+          <label>{t('leftPanel.filterPages')}</label>
+          <div class="annotations-filter-range">
+            <input type="text" inputmode="numeric" placeholder={t('leftPanel.filterFrom')}
+              value={listFilter().paginaVan ?? ''} onInput={(e) => setListFilter({ paginaVan: e.target.value })} />
+            <span>-</span>
+            <input type="text" inputmode="numeric" placeholder={t('leftPanel.filterTo')}
+              value={listFilter().paginaTot ?? ''} onInput={(e) => setListFilter({ paginaTot: e.target.value })} />
+          </div>
+          <label>{t('leftPanel.filterDate')}</label>
+          <div class="annotations-filter-range">
+            <input type="date" title={t('leftPanel.filterFrom')}
+              value={listFilter().datumVan || ''} onChange={(e) => setListFilter({ datumVan: e.target.value })} />
+            <span>-</span>
+            <input type="date" title={t('leftPanel.filterTo')}
+              value={listFilter().datumTot || ''} onChange={(e) => setListFilter({ datumTot: e.target.value })} />
+          </div>
+          <div class="annotations-filter-actions">
+            <button class="annotations-filter-clear" disabled={!anyListFilterActive()} onClick={clearFilters}>
+              {t('leftPanel.filterClear')}
+            </button>
+          </div>
+        </div>
+      </Show>
+      <div class="annotations-list-content">
+        <Show when={emptyMessage()}>
+          <div class="annotations-list-empty">{emptyMessage()}</div>
+        </Show>
+        <Show when={!emptyMessage()}>
+          <For each={items()}>
+            {(item) => (
+              <Show when={item.isHeader} fallback={
+                <Show when={!collapsedGroups().has(item.groupKey)}>
+                  <div
+                    class={`annotation-list-item${item.selected ? ' selected' : ''}`}
+                    on:click={(e) => {
+                      const ctrlKey = e.ctrlKey || e.metaKey;
+                      import('../../../../ui/panels/annotations-list.js').then(m => m.selectAnnotationItem(item.id, item.page, ctrlKey));
+                    }}
+                  >
+                    <div class="annotation-list-color" style={{ 'background-color': item.color }}></div>
+                    <div class="annotation-list-info">
+                      <div class="annotation-list-type">
+                        {item.typeLabel}
+                        <Show when={item.statusColor}>
+                          <span style={{ color: item.statusColor, 'margin-left': '6px', 'font-size': '10px' }} title={item.statusTitle}>
+                            {'\u25CF'}
+                          </span>
+                        </Show>
+                        <Show when={item.replyCount > 0}>
+                          <span style={{ 'margin-left': '6px', 'font-size': '10px', color: 'var(--theme-panel-tab-text)' }}>
+                            ({item.replyCount})
+                          </span>
+                        </Show>
+                      </div>
+                      <Show when={item.text}>
+                        <div class="annotation-list-preview">{item.text}</div>
+                      </Show>
+                      <div class="annotation-list-meta">{item.meta}</div>
+                    </div>
+                  </div>
+                </Show>
+              }>
+                <Show when={item.sortMode === 'color'}>
+                  <div
+                    class={`annotations-list-page-header annotations-list-color-header${collapsedGroups().has(item.groupKey) ? ' collapsed' : ''}`}
+                    onClick={() => toggleGroup(item.groupKey)}
+                  >
+                    <svg class="annotations-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points={collapsedGroups().has(item.groupKey) ? "9 6 15 12 9 18" : "6 9 12 15 18 9"}/>
+                    </svg>
+                    <span class="annotations-list-color-swatch" style={{ 'background-color': item.headerColor }}></span>
+                    <span>{item.headerColor}</span>
+                  </div>
+                </Show>
+                <Show when={item.sortMode !== 'color'}>
+                  <div
+                    class={`annotations-list-page-header${collapsedGroups().has(item.groupKey) ? ' collapsed' : ''}`}
+                    onClick={() => toggleGroup(item.groupKey)}
+                  >
+                    <svg class="annotations-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points={collapsedGroups().has(item.groupKey) ? "9 6 15 12 9 18" : "6 9 12 15 18 9"}/>
+                    </svg>
+                    {headerText(item)}
+                  </div>
+                </Show>
+              </Show>
+            )}
+          </For>
+        </Show>
+      </div>
+      <div class="annotations-list-count">{countText()}</div>
+    </div>
+  );
+}

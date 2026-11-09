@@ -1,0 +1,519 @@
+import { plaatsTekstOpPagina } from '../text/wrap-tekst.js';
+import { state, getActiveDocument, getPageRotation } from '../core/state.js';
+import { redrawAnnotations, redrawContinuous } from '../annotations/rendering.js';
+import { hasFill } from '../annotations/fill-utils.js';
+import { showProperties, hideProperties } from '../ui/panels/properties-panel.js';
+import { recordAdd, recordModify, execute } from '../core/undo-manager.js';
+import { cloneAnnotation } from '../annotations/factory.js';
+import { markDocumentModified } from '../ui/chrome/tabs.js';
+import { injectSyntheticTextSpans } from '../text/text-layer.js';
+import { invertPageRotation, resolveTextEditPageGeometry, toStandardFontName } from '../text/text-edit-appearance.js';
+import { annotationCanvas } from '../ui/dom-elements.js';
+import { viewport as vpState } from '../pdf/pdf-viewport.js';
+import { paginaNaarClient, weergaveRotatie } from '../pdf/weergave-ruimte.js';
+import { hasMixedRuns, textboxLineRuns } from '../annotations/rendering/textbox-layout.js';
+import { editorVakOpmaak } from './text-edit-vak.js';
+import { editorAchtergrond, caretKleur, meetOndergrond } from './editor-ondergrond.js';
+import { layerForNewAnnotation } from '../annotations/annotatie-lagen.js';
+import { deleteAnnotationsWithUndo } from '../annotations/mutations.js';
+import { besluitBijEsc, ESC_VERWIJDEREN } from './text-edit-esc.js';
+import {
+  showTextEditOverlay, hideTextEditOverlay,
+  getTextEditValue as getTextValue, getTextEditHeightGrowth as getHeightGrowth,
+  getTextEditLineRuns as getLineRuns,
+  openStickyPopup,
+} from '../bridge.js';
+import { setOverlayStyle as setTextEditOverlayStyle } from '../solid/stores/textEditOverlayStore.js';
+
+// Schaal van de open editor (CSS-pixels per paginapunt), voor werkEditorStijlBij.
+let _editorSchaal = 1.5;
+
+// CSS-lettertypeketen zoals shapes.js drawTextboxContent: eerst de variant
+// met spaties ("SegoeUI" → "Segoe UI"), dan de naam zelf, dan sans-serif.
+function cssLettertype(fontFamily) {
+  const raw = fontFamily || 'Arial';
+  const quote = s => `"${s.replace(/"/g, '\\"')}"`;
+  const expanded = raw.replace(/([a-z])([A-Z])/g, '$1 $2');
+  const chain = [];
+  if (expanded !== raw) chain.push(quote(expanded));
+  chain.push(/[\s"',]/.test(raw) ? quote(raw) : raw);
+  chain.push('sans-serif');
+  return chain.join(', ');
+}
+
+/**
+ * Het eigenschappenpaneel wijzigt lettertype, grootte of kleur terwijl de
+ * editor van dit vak open is (#765): pas de editor meteen aan.
+ */
+export function werkEditorStijlBij(annotation) {
+  if (!state.isEditingText || !annotation || state.editingAnnotation?.id !== annotation.id) return;
+  setTextEditOverlayStyle((stijl) => ({
+    ...stijl,
+    'font-family': cssLettertype(annotation.fontFamily),
+    'font-size': `${(annotation.fontSize || 14) * _editorSchaal}px`,
+    color: annotation.textColor || annotation.color || '#000000',
+  }));
+}
+
+// Start inline text editing for textbox/callout
+// Inline opmaak (deels vet/cursief) uit de editor overnemen: alleen bewaren
+// als er echt iets afwijkt van de basisstijl; anders blijft het vlak een
+// gewoon plat tekstvlak. Gedeeld door de commit-bij-blur en finishTextEditing.
+function neemInlineOpmaakOver(ann, newText) {
+  const runs = getLineRuns();
+  if (Array.isArray(runs) && runs.length && hasMixedRuns({ ...ann, text: newText, textRuns: runs })) {
+    ann.textRuns = runs;
+  } else {
+    delete ann.textRuns;
+  }
+}
+
+/**
+ * @param {object} annotation  textbox of callout
+ * @param {{ nieuw?: boolean }} [opties]  nieuw: het vak is net neergezet;
+ *   Esc haalt het dan weg zolang er niets in staat (#951).
+ */
+export function startTextEditing(annotation, { nieuw = false } = {}) {
+  // Idempotency guard: if already editing this same annotation, do nothing.
+  // Without this, double-firing handlers (select-tool dblclick + dispatcher dblclick)
+  // call finishTextEditing on a freshly-opened overlay, wiping the existing text.
+  if (state.isEditingText && state.editingAnnotation === annotation) {
+    return;
+  }
+  if (state.isEditingText) {
+    finishTextEditing();
+  }
+
+  if (!['textbox', 'callout'].includes(annotation.type)) return;
+  if (annotation.locked) return;
+
+  // In de doorlopende weergave is het enkelpagina-canvas 0x0 op de
+  // vensteroorsprong; de overlay moet daar tegen het canvas van de PAGINA
+  // van de annotatie gepositioneerd worden. Anders verschijnt de editor op
+  // kale vensterco-ordinaten — als een leeg "spook-tekstvak" over het
+  // linkerpaneel — terwijl de echte annotatie op de pagina staat.
+  const _editDoc = getActiveDocument();
+  const isContinuous = _editDoc?.viewMode === 'continuous';
+  let canvas = null;
+  if (isContinuous) {
+    canvas = document.querySelector(
+      `.page-wrapper[data-page="${annotation.page}"] .canvas-container-cont`);
+  }
+  if (!canvas) canvas = annotationCanvas || document.getElementById('annotation-canvas');
+  if (!canvas) return;
+
+  state.isEditingText = true;
+  state.editingAnnotation = annotation;
+  state._textEditSnapshot = cloneAnnotation(annotation);
+
+  // Get canvas position
+  const canvasRect = canvas.getBoundingClientRect();
+
+  // Calculate position based on annotation.
+  // Viewport mode (vector renderer): annotations are placed at
+  //   screen = canvasRect + offset + ann_pos * zoom
+  // Legacy mode: annotations are placed at
+  //   screen = canvasRect + ann_pos * scale
+  // The textarea overlay must use the SAME math the annotation canvas uses,
+  // otherwise it appears off-screen and the user can't find/edit the text.
+  // In de doorlopende weergave geldt: scherm = paginacanvas-rect + pos * doc.scale
+  // (zelfde formule als clipboard/visibleCenterOnPage). Het viewport-singleton
+  // (vpState) hoort bij de ENKELpagina-weergave en blijft na een moduswissel
+  // `active` staan; zijn zoom/offsets meenemen zet de overlay naast het scherm.
+  const doc = getActiveDocument();
+  const useViewport = !isContinuous && vpState && vpState.active;
+  const scale = useViewport ? vpState.zoom : (doc?.scale || 1.5);
+  const offX = useViewport ? vpState.offsetX : 0;
+  const offY = useViewport ? vpState.offsetY : 0;
+  const width = annotation.width || 150;
+  const height = annotation.height || 50;
+  const scaledWidth = width * scale;
+  const scaledHeight = height * scale;
+
+  // Calculate center position of the annotation. Via de centrale omrekening
+  // (pdf/weergave-ruimte.js), zodat het midden ook bij een gedraaide weergave
+  // (#200) op het vak valt; de oude formule blijft de terugval.
+  const midden = paginaNaarClient(annotation.page ?? doc?.currentPage ?? 1,
+    annotation.x + width / 2, annotation.y + height / 2, doc);
+  const centerX = midden ? midden.x : canvasRect.left + offX + (annotation.x + width / 2) * scale;
+  const centerY = midden ? midden.y : canvasRect.top + offY + (annotation.y + height / 2) * scale;
+  // Op het scherm staat het vak gedraaid over zijn eigen rotatie plus de
+  // weergaverotatie: de editor draait mee zodat hij het vak exact bedekt.
+  const schermRotatie = (Number(annotation.rotation) || 0) + weergaveRotatie(doc);
+
+  // Build a CSS font-family fallback chain matching shapes.js
+  // drawTextboxContent — some editors emit "SegoeUI" (no space)
+  // which neither Canvas nor CSS resolves to the installed Segoe UI family
+  // without the camelCase-expanded variant in the fallback list. Without
+  // this, edit-mode textarea silently falls back to the browser default
+  // (Times Serif on Windows), giving a font that differs from what the
+  // canvas renders → user sees one shape while editing, another after
+  // commit.
+  const cssFontFamily = cssLettertype(annotation.fontFamily);
+  _editorSchaal = scale;
+
+  // Rand en opvulling zo dat de editor op dezelfde breedte afbreekt als het
+  // canvas (zie text-edit-vak.js): anders sprong een woord dat op het canvas
+  // paste bij het bewerken naar een tweede regel en groeide het vak mee.
+  const vakOpmaak = editorVakOpmaak(annotation, scale);
+
+  // Build style object for the textarea overlay
+  const styleObj = {
+    position: 'fixed',
+    left: `${centerX}px`,
+    top: `${centerY}px`,
+    width: `${scaledWidth}px`,
+    height: `${scaledHeight}px`,
+    'font-size': `${(annotation.fontSize || 14) * scale}px`,
+    'font-family': cssFontFamily,
+    color: annotation.textColor || annotation.color || '#000000',
+    // De vulling van het vak, of doorzichtig zonder vulling (#698): witte
+    // tekst op een donkere ondergrond blijft zo leesbaar. Het canvas tekent
+    // de tekst van dit vak zolang de editor open is niet (rendering.js).
+    'background-color': editorAchtergrond(annotation.fillColor),
+    'caret-color': caretKleur({
+      fillColor: annotation.fillColor,
+      ondergrond: hasFill(annotation.fillColor) ? null : meetOndergrond({
+        left: centerX - scaledWidth / 2, top: centerY - scaledHeight / 2,
+        width: scaledWidth, height: scaledHeight,
+      }),
+      tekstKleur: annotation.textColor || annotation.color,
+    }),
+    ...vakOpmaak,
+    'box-sizing': 'border-box',
+    resize: 'none',
+    outline: 'none',
+    'z-index': '1200',
+    overflow: 'hidden',
+    transform: schermRotatie % 360
+      ? `translate(-50%, -50%) rotate(${schermRotatie}deg)`
+      : 'translate(-50%, -50%)',
+    // Voor de groei-correctie in TextEditOverlay (bovenrand blijft staan).
+    '--scherm-rotatie': String(schermRotatie),
+  };
+
+  // Apply text styles
+  if (annotation.fontBold) styleObj['font-weight'] = 'bold';
+  if (annotation.fontItalic) styleObj['font-style'] = 'italic';
+  if (annotation.textAlign) styleObj['text-align'] = annotation.textAlign;
+  // Verticale uitlijning: de tekst blijft tijdens het bewerken staan waar de
+  // canvas hem tekent (rendering/textbox-layout.js, verticaleVerschuiving).
+  if (annotation.textVAlign === 'middle' || annotation.textVAlign === 'bottom') {
+    styleObj.display = 'flex';
+    styleObj['flex-direction'] = 'column';
+    styleObj['justify-content'] = annotation.textVAlign === 'middle' ? 'center' : 'flex-end';
+  }
+  // Line spacing: CSS line-height adds half-leading above first line.
+  // To show spacing only below text, we shift the textarea up inside a clipping wrapper.
+  // Match shapes.js DEFAULT_LINE_SPACING (=1.2) so the edit overlay shows
+  // the same line gap the canvas will draw on commit.
+  const ls = annotation.lineSpacing || 1.2;
+  styleObj['line-height'] = ls;
+  const halfLeading = ((ls - 1) * (annotation.fontSize || 14) * scale) / 2;
+  // Pass halfLeading offset to the overlay component via a custom property
+  styleObj['--text-offset'] = `${halfLeading}px`;
+
+  const initialText = annotation.text || '';
+  // Inline opmaak meegeven; alleen geldig als de runs bij de tekst horen.
+  const initialRuns = hasMixedRuns(annotation) ? textboxLineRuns(annotation) : null;
+
+  // Commit function: update annotation and refresh display
+  const commitFn = (newText) => {
+    if (!state.isEditingText || !state.editingAnnotation) return;
+
+    const ann = state.editingAnnotation;
+    ann.text = newText;
+    neemInlineOpmaakOver(ann, newText);
+    ann.modifiedAt = new Date().toISOString();
+
+    // Apply auto-grown height back to annotation
+    const growth = getHeightGrowth();
+    if (growth > 0) {
+      const commitDoc = getActiveDocument();
+      const commitScale = commitDoc?.scale || 1.5;
+      ann.height = (ann.height || 50) + growth / commitScale;
+    }
+
+    if (state._textEditSnapshot && ann.id) {
+      // Formatting toggles (bold/italic/underline/textColor/fontFamily/fontSize)
+      // are recorded by their own panel-edit recordModify calls. The text-edit
+      // session should only record text + height changes, so align the snapshot's
+      // formatting fields with the current annotation before recording.
+      const snap = state._textEditSnapshot;
+      ['fontBold', 'fontItalic', 'fontUnderline', 'textColor', 'fontFamily', 'fontSize',
+       'fillColor', 'strokeColor', 'lineWidth', 'textAlign', 'lineSpacing', 'rotation', 'opacity']
+        .forEach(k => { if (k in ann) snap[k] = ann[k]; });
+      recordModify(ann.id, snap, ann);
+    }
+
+    state.isEditingText = false;
+    state.editingAnnotation = null;
+    state.textEditElement = null;
+    state._textEditSnapshot = null;
+
+    if (getActiveDocument()?.viewMode === 'continuous') {
+      redrawContinuous();
+    } else {
+      redrawAnnotations();
+    }
+
+    const _doc = getActiveDocument();
+    if (_doc && _doc.selectedAnnotation === ann) {
+      showProperties(ann);
+    }
+  };
+
+  // Esc (#951): de getypte tekst blijft staan, zoals bij het verlaten van de
+  // editor met een klik ernaast. Alleen een net neergezet vak zonder tekst
+  // gaat weg (text-edit-esc.js).
+  const cancelFn = () => {
+    if (!state.isEditingText || !state.editingAnnotation) return;
+    const huidigeTekst = getTextValue();
+    if (besluitBijEsc({ nieuw, tekst: huidigeTekst }) !== ESC_VERWIJDEREN) {
+      commitFn(huidigeTekst);
+      return;
+    }
+
+    const ann = state.editingAnnotation;
+
+    state.isEditingText = false;
+    state.editingAnnotation = null;
+    state.textEditElement = null;
+    state._textEditSnapshot = null;
+
+    // Het lege nieuwe vak weg, als één ongedaan-stap (ongedaan maken zet het
+    // lege vak terug, zoals het neerzetten zelf ook een stap was).
+    const _doc = getActiveDocument();
+    if (_doc && _doc.annotations.includes(ann)) {
+      deleteAnnotationsWithUndo(_doc, [ann]);
+      if (_doc.selectedAnnotation === ann) _doc.selectedAnnotation = null;
+      if (Array.isArray(_doc.selectedAnnotations)) {
+        _doc.selectedAnnotations = _doc.selectedAnnotations.filter(a => a !== ann);
+      }
+      markDocumentModified(_doc);
+      hideProperties();
+    }
+
+    if (getActiveDocument()?.viewMode === 'continuous') {
+      redrawContinuous();
+    } else {
+      redrawAnnotations();
+    }
+  };
+
+  showTextEditOverlay(styleObj, initialText, commitFn, cancelFn, initialRuns);
+  state.textEditElement = true;
+  // Het canvas opnieuw tekenen zonder de tekst van dit vak: de editor is
+  // doorzichtig, anders stond de oude tekst onder de getypte.
+  if (isContinuous) redrawContinuous();
+  else redrawAnnotations();
+}
+
+// Finish inline text editing (called externally, e.g. when switching tools)
+export function finishTextEditing() {
+  if (!state.isEditingText || !state.editingAnnotation) return;
+
+  const annotation = state.editingAnnotation;
+
+  // Get the current text value from the Solid store
+  const currentText = getTextValue();
+  annotation.text = currentText;
+  neemInlineOpmaakOver(annotation, currentText);
+  annotation.modifiedAt = new Date().toISOString();
+
+  // Apply auto-grown height back to annotation
+  const growth = getHeightGrowth();
+  if (growth > 0) {
+    const doc = getActiveDocument();
+    const finishScale = doc?.scale || 1.5;
+    annotation.height = (annotation.height || 50) + growth / finishScale;
+  }
+
+  if (state._textEditSnapshot && annotation.id) {
+    // Align formatting fields with the current annotation so this recordModify
+    // only captures text/height changes — formatting toggles have their own
+    // recordModify entries from the property panel/keyboard shortcuts.
+    const snap = state._textEditSnapshot;
+    ['fontBold', 'fontItalic', 'fontUnderline', 'textColor', 'fontFamily', 'fontSize',
+     'fillColor', 'strokeColor', 'lineWidth', 'textAlign', 'lineSpacing', 'rotation', 'opacity']
+      .forEach(k => { if (k in annotation) snap[k] = annotation[k]; });
+    recordModify(annotation.id, snap, annotation);
+  }
+
+  hideTextEditOverlay();
+
+  // Reset state
+  state.isEditingText = false;
+  state.editingAnnotation = null;
+  state.textEditElement = null;
+  state._textEditSnapshot = null;
+
+  // Refresh display
+  if (getActiveDocument()?.viewMode === 'continuous') {
+    redrawContinuous();
+  } else {
+    redrawAnnotations();
+  }
+
+  // Update properties panel
+  const _doc2 = getActiveDocument();
+  if (_doc2 && _doc2.selectedAnnotation === annotation) {
+    showProperties(annotation);
+  }
+}
+
+// Show the text annotation dialog and return a promise with the result
+function showTextAnnotationDialog() {
+  return new Promise((resolve) => {
+    import('../solid/stores/dialogStore.js').then(({ openDialog }) => {
+      openDialog('text-annotation', { onResult: resolve });
+    });
+  });
+}
+
+// Breedte van een tekenreeks in PDF-punten voor de standaard-PDF-lettertypen,
+// gemeten met het canvas (schermlettertype dat erop lijkt). Zonder canvas een
+// schatting van 0,55 x de lettergrootte per teken.
+function maakTekstMeter(pdfFont, fontSize) {
+  const gewicht = /Bold/.test(pdfFont) ? 'bold ' : '';
+  const stand = /Italic|Oblique/.test(pdfFont) ? 'italic ' : '';
+  const css = /^Courier/.test(pdfFont) ? '"Courier New", Courier, monospace'
+    : /^Times/.test(pdfFont) ? '"Times New Roman", Times, serif'
+    : 'Helvetica, Arial, sans-serif';
+  let ctx = null;
+  try {
+    ctx = document.createElement('canvas').getContext('2d');
+    ctx.font = `${stand}${gewicht}${fontSize}px ${css}`;
+  } catch (e) { ctx = null; }
+  return (str) => (ctx ? ctx.measureText(str).width : str.length * fontSize * 0.55);
+}
+
+// Add PDF content text at position (stored as textEdit, burned into PDF on save)
+export async function addTextAnnotation(x, y, pageNum, canvasEl) {
+  const result = await showTextAnnotationDialog();
+  if (!result) return;
+
+  const doc = getActiveDocument();
+  const page = pageNum || (doc ? doc.currentPage : 1);
+
+  // Determine page height for coordinate conversion
+  const addTextScale = doc?.scale || 1.5;
+  const dpr = window.devicePixelRatio || 1;
+  const activeCanvas = canvasEl || annotationCanvas || document.getElementById('annotation-canvas');
+  if (!activeCanvas) return;
+  const geometry = resolveTextEditPageGeometry(
+    doc?.pageDims?.[page],
+    activeCanvas.width / (addTextScale * dpr),
+    activeCanvas.height / (addTextScale * dpr),
+    getPageRotation(page),
+  );
+  const unrotatedPoint = invertPageRotation(
+    x,
+    y,
+    geometry.pageWidth,
+    geometry.pageHeight,
+    geometry.rotation,
+  );
+
+  // Convert visual page coordinates to PDF user-space (origin at bottom-left).
+  const pdfX = unrotatedPoint.x;
+  const pdfY = geometry.pageHeight - unrotatedPoint.y;
+
+  // Map dialog font family + bold/italic to standard PDF font name. Tekst in
+  // de pagina komt altijd in een standaardletter; de dialoog meldt welke
+  // (lettertype-inbedding.js, #765). Zelfde indeling als PDF-tekst bewerken.
+  const fontFamily = toStandardFontName(result.fontFamily || 'Arial', !!result.fontBold, !!result.fontItalic);
+
+  const fontSize = result.fontSize || 16;
+
+  // Lange tekst binnen de pagina houden: afbreken op de rechtermarge, en het
+  // beginpunt alleen naar links schuiven als de tekst er anders niet past.
+  // Zonder dit liep de tekst als één regel de pagina uit.
+  const plaatsing = plaatsTekstOpPagina({
+    tekst: result.text,
+    x: pdfX,
+    paginaBreedte: geometry.pageWidth,
+    meet: maakTekstMeter(fontFamily, fontSize),
+  });
+
+  const editRecord = {
+    id: Date.now() + Math.random().toString(36).substr(2, 9),
+    page,
+    originalText: '',
+    newText: plaatsing.tekst,
+    pdfX: plaatsing.x,
+    pdfY,
+    pdfWidth: 0,
+    fontSize,
+    lineSpacing: fontSize * 1.2,
+    numOriginalLines: 0,
+    fontFamily,
+    loadedFontName: '',
+    pdfFontName: '',
+    color: result.color || '#000000',
+    originalSpanTexts: []
+  };
+
+  if (doc) {
+    if (!doc.textEdits) doc.textEdits = [];
+    doc.textEdits.push(editRecord);
+    execute({ type: 'addTextEdit', textEdit: { ...editRecord } });
+    markDocumentModified();
+  }
+
+  // Inject synthetic text layer span so the text is selectable and editable
+  const textLayer = document.querySelector(`.textLayer[data-page="${page}"]`)
+    || document.querySelector('.textLayer');
+  if (textLayer) {
+    if (activeCanvas) {
+      const pw = activeCanvas.width / addTextScale;
+      const ph = activeCanvas.height / addTextScale;
+      injectSyntheticTextSpans(textLayer, page, pw, ph);
+    }
+  }
+
+  if (getActiveDocument()?.viewMode === 'continuous') {
+    redrawContinuous();
+  } else {
+    redrawAnnotations();
+  }
+}
+
+// Add comment/sticky note at position and open popup for editing
+export function addComment(x, y) {
+  const annotation = {
+    id: Date.now().toString(36) + Math.random().toString(36).substr(2, 9),
+    type: 'comment',
+    page: getActiveDocument()?.currentPage || 1,
+    x: x,
+    y: y,
+    width: 24,
+    height: 24,
+    text: '',
+    color: state.preferences.commentColor || '#FFFF00',
+    fillColor: state.preferences.commentColor || '#FFFF00',
+    icon: state.preferences.commentIcon || 'comment',
+    author: state.defaultAuthor,
+    createdAt: new Date().toISOString(),
+    modifiedAt: new Date().toISOString(),
+    locked: false,
+    printable: true,
+    popupOpen: true
+  };
+
+  const doc = getActiveDocument();
+  // Een nieuwe markering landt op de huidige laag (#468), zoals via createAnnotation.
+  const laag = layerForNewAnnotation(doc);
+  if (laag) annotation.layer = laag;
+  if (doc) doc.annotations.push(annotation);
+  recordAdd(annotation);
+
+  if (doc?.viewMode === 'continuous') {
+    redrawContinuous();
+  } else {
+    redrawAnnotations();
+  }
+
+  // Open popup immediately for text entry
+  openStickyPopup(annotation);
+}

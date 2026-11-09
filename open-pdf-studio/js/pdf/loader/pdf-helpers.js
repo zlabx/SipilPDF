@@ -1,0 +1,193 @@
+// Map PDF internal font name to CSS font family, and extract bold/italic style info
+// Returns { family, bold, italic } or null
+export function mapPdfFontName(pdfName) {
+  if (!pdfName) return null;
+  // Remove leading slash if present
+  const name = pdfName.replace(/^\//, '');
+
+  // Skip pure reference names like "F1", "F8", "Ff12" - these are not real font names
+  if (/^[Ff]\d+$/.test(name)) return null;
+
+  // Common PDF standard font mappings
+  const fontMap = {
+    'Helv': { family: 'Helvetica' },
+    'HeBo': { family: 'Helvetica', bold: true },
+    'Helvetica': { family: 'Helvetica' },
+    'Helvetica-Bold': { family: 'Helvetica', bold: true },
+    'Helvetica-Oblique': { family: 'Helvetica', italic: true },
+    'Helvetica-BoldOblique': { family: 'Helvetica', bold: true, italic: true },
+    'Cour': { family: 'Courier New' },
+    'Courier': { family: 'Courier New' },
+    'Courier-Bold': { family: 'Courier New', bold: true },
+    'Courier-Oblique': { family: 'Courier New', italic: true },
+    'Courier-BoldOblique': { family: 'Courier New', bold: true, italic: true },
+    'TiRo': { family: 'Times New Roman' },
+    'Times': { family: 'Times New Roman' },
+    'Times-Roman': { family: 'Times New Roman' },
+    'Times-Bold': { family: 'Times New Roman', bold: true },
+    'Times-Italic': { family: 'Times New Roman', italic: true },
+    'Times-BoldItalic': { family: 'Times New Roman', bold: true, italic: true },
+    'Symbol': { family: 'Symbol' },
+    'ZapfDingbats': { family: 'ZapfDingbats' },
+    'ZaDb': { family: 'ZapfDingbats' },
+    'Arial': { family: 'Arial' },
+    'ArialMT': { family: 'Arial' },
+    'Arial-BoldMT': { family: 'Arial', bold: true },
+    'Arial-ItalicMT': { family: 'Arial', italic: true },
+    'Arial-BoldItalicMT': { family: 'Arial', bold: true, italic: true },
+  };
+
+  if (fontMap[name]) return fontMap[name];
+
+  // Try to extract base font family from composite names like "SegoeUI-Bold", "ABCDEF+SegoeUI"
+  let cleaned = name;
+  // Remove subset prefix (e.g., "ABCDEF+")
+  cleaned = cleaned.replace(/^[A-Z]{6}\+/, '');
+
+  // Detect bold/italic from style suffixes before removing them
+  const stylePart = cleaned.match(/[-,](Bold|Italic|Regular|Light|Medium|Semibold|SemiBold|Thin|ExtraBold|Black|Oblique|BoldItalic|BoldOblique|It)+$/i);
+  let bold = false, italic = false;
+  if (stylePart) {
+    const s = stylePart[0].toLowerCase();
+    bold = /bold|black|extrabold/i.test(s);
+    italic = /italic|oblique|(?:^|-)it$/i.test(s);
+  }
+
+  // Remove style suffixes
+  cleaned = cleaned.replace(/[-,](Bold|Italic|Regular|Light|Medium|Semibold|SemiBold|Thin|ExtraBold|Black|Oblique|BoldItalic|BoldOblique|It)+$/i, '');
+
+  // Insert spaces before capitals for CamelCase names (e.g., "SegoeUI" -> "Segoe UI")
+  const spaced = cleaned.replace(/([a-z])([A-Z])/g, '$1 $2');
+
+  return spaced ? { family: spaced, bold, italic } : null;
+}
+
+/**
+ * Het lettertype uit /RC (rich text, XHTML) van een FreeText: de eerste
+ * familie uit `font-family:` of uit de `font:`-verkorting ("12pt Georgia").
+ * Een generieke familie (sans-serif, serif, ...) telt niet. Zonder /DS was
+ * dit de enige plek waar het lettertype stond, en de lader las het niet: het
+ * vak kwam terug in de letter van /DA, meestal Helvetica (#765).
+ * @param {string} rc
+ * @returns {string|null}
+ */
+export function rcLettertype(rc) {
+  if (!rc) return null;
+  const tekst = String(rc).replace(/&quot;|&#34;/g, '"').replace(/&apos;|&#39;/g, "'");
+  const lijsten = [];
+  for (const m of tekst.matchAll(/font-family\s*:\s*([^;"]+|"[^"]*"[^;"]*)/gi)) lijsten.push(m[1]);
+  for (const m of tekst.matchAll(/(?:^|[;\s"'])font\s*:\s*([^;"]*)/gi)) {
+    const na = m[1].match(/[\d.]+(?:pt|px|em|%)(?:\s*\/\s*[\d.]+\w*)?\s+(.+)$/i);
+    if (na) lijsten.push(na[1]);
+  }
+  for (const lijst of lijsten) {
+    for (const deel of lijst.split(',')) {
+      const naam = deel.trim().replace(/^['"]|['"]$/g, '').trim();
+      if (naam && !/^(sans-serif|serif|monospace|cursive|fantasy|system-ui|inherit|initial)$/i.test(naam)) return naam;
+    }
+  }
+  return null;
+}
+
+// Streeppatronen die de app zelf schrijft (saver/appearance-vectors.js
+// dashArrayForStyle; lijnstijl-rondgang.test.mjs houdt ze gelijk).
+const EIGEN_STREEPPATRONEN = Object.freeze({
+  dashed: [3, 4],
+  dotted: [2, 4],
+  'dash-dot': [10, 8, 2, 8],
+  'dash-dot-dot': [10, 8, 2, 8, 2, 8],
+  'long-dash': [20, 10],
+  'long-dash-dot': [20, 10, 2, 10],
+  'long-dash-dot-dot': [20, 10, 2, 10, 2, 10],
+});
+export { EIGEN_STREEPPATRONEN };
+
+/**
+ * De lijnstijl bij een streeppatroon (/BS /D, als getallen), of null zonder
+ * bruikbaar patroon. Een eigen patroon van de app geeft zijn eigen stijl;
+ * anders zijn korte streepjes en gaten (beide <= 3, zoals het oude [2 2])
+ * gestippeld en de rest gestreept (ook het oude [8 4]).
+ */
+export function lijnstijlUitStreep(d) {
+  if (!Array.isArray(d) || d.length < 2) return null;
+  for (const [stijl, p] of Object.entries(EIGEN_STREEPPATRONEN)) {
+    if (p.length === d.length && p.every((v, i) => v === d[i])) return stijl;
+  }
+  const [d0, d1] = d;
+  const getal = (v) => typeof v === 'number' && Number.isFinite(v);
+  return getal(d0) && getal(d1) && d0 <= 3 && d1 <= 3 ? 'dotted' : 'dashed';
+}
+
+// Helper to map PDF.js borderStyle.style to our border style string
+// PDF.js values: 1=SOLID, 2=DASHED, 3=BEVELED, 4=INSET, 5=UNDERLINE
+export function mapBorderStyle(annot, extraColors) {
+  // Prefer dash array analysis from pdf-lib (distinguishes dotted from dashed)
+  if (extraColors?.borderStyle) return extraColors.borderStyle;
+  const style = annot.borderStyle?.style;
+  if (style === 2) return 'dashed';
+  if (style === 3 || style === 4) return 'dotted';
+  return 'solid';
+}
+
+// Helper to get number from pdf-lib PDFNumber
+export function pdfNum(obj) {
+  if (!obj) return null;
+  if (typeof obj === 'number') return obj;
+  if (typeof obj.numberValue === 'number') return obj.numberValue;
+  if (typeof obj.asNumber === 'function') return obj.asNumber();
+  return null;
+}
+
+// Decompress zlib/deflate data using Web Streams API
+export async function inflateBytes(compressed) {
+  try {
+    const ds = new DecompressionStream('deflate');
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    writer.write(compressed);
+    writer.close();
+    const chunks = [];
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const c of chunks) { result.set(c, offset); offset += c.length; }
+    return result;
+  } catch (e) {
+    // Try raw deflate (no zlib header)
+    try {
+      const ds = new DecompressionStream('raw');
+      const writer = ds.writable.getWriter();
+      const reader = ds.readable.getReader();
+      writer.write(compressed);
+      writer.close();
+      const chunks = [];
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      let total = 0;
+      for (const c of chunks) total += c.length;
+      const result = new Uint8Array(total);
+      let offset = 0;
+      for (const c of chunks) { result.set(c, offset); offset += c.length; }
+      return result;
+    } catch (e2) {
+      return null;
+    }
+  }
+}
+
+// Convert pdf-lib color array to hex
+export function pdfColorToHex(colorArray, context) {
+  if (!colorArray || typeof colorArray.size !== 'function' || colorArray.size() < 3) return null;
+  const r = pdfNum(colorArray.get(0)), g = pdfNum(colorArray.get(1)), b = pdfNum(colorArray.get(2));
+  if (r === null || g === null || b === null) return null;
+  return `#${Math.round(r * 255).toString(16).padStart(2, '0')}${Math.round(g * 255).toString(16).padStart(2, '0')}${Math.round(b * 255).toString(16).padStart(2, '0')}`;
+}

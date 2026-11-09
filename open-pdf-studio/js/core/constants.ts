@@ -1,0 +1,439 @@
+import type { Preferences } from '../types/preferences.js';
+import { MCP_STANDAARD } from './mcp-standaard.js';
+
+// Handle types for annotation selection and manipulation
+export const HANDLE_SIZE = 6;
+
+export const HANDLE_TYPES = {
+  MOVE: 'move',
+  TOP_LEFT: 'tl',
+  TOP_RIGHT: 'tr',
+  BOTTOM_LEFT: 'bl',
+  BOTTOM_RIGHT: 'br',
+  TOP: 't',
+  BOTTOM: 'b',
+  LEFT: 'l',
+  RIGHT: 'r',
+  LINE_START: 'line_start',
+  LINE_END: 'line_end',
+  RADIUS: 'radius',
+  ROTATE: 'rotate',
+  // Eigen draaipunt van afbeelding/stempel/handtekening (#826, draaipunt.js).
+  PIVOT: 'pivot',
+  CALLOUT_ARROW: 'callout_arrow',
+  CALLOUT_KNEE: 'callout_knee',
+  CALLOUT_MOVE: 'callout_move',
+  POLYLINE_NODE: 'polyline_node',
+  POLYLINE_EDGE: 'polyline_edge',
+  LEADER_START: 'leader_start',
+  LEADER_END: 'leader_end',
+  LABEL_MOVE: 'label_move',
+  // Textbox multi-leader handles. <id> is appended to encode the leader.
+  LEADER_ADD: 'leader_add',
+  LEADER_TIP: 'leader_tip',
+  LEADER_KNEE: 'leader_knee',
+  LEADER_DELETE: 'leader_delete',
+  // ─── Grippoints (CAD-style stretch grips) ──────────────────────────────
+  // These are emitted in addition to (or in place of) the resize handles
+  // above. They drive the "grip stretch" interaction in select-tool: click
+  // a grip → enter stretch mode anchored at the grip's original location.
+  LINE_MID: 'line_mid',           // line/arrow midpoint → move whole line
+  RECT_CENTER: 'rect_center',     // box/rect/textbox center → move whole shape
+  CIRCLE_CENTER: 'circle_center', // circle center → move whole circle
+  POLYLINE_EDGE_MID: 'polyline_edge_mid',
+} as const;
+
+// Default application preferences
+export const DEFAULT_PREFERENCES: Preferences = {
+  // Theme
+  theme: 'default',
+  uiScale: 100,
+
+  // Enkelpagina is de standaard-weergavemodus; opgeslagen 'continuous'
+  // (de kortstondige oude default, nergens instelbaar in de UI) wordt bij
+  // het laden teruggezet (zie preferences.js).
+  defaultViewMode: 'single',
+  // Voorkeurs-OCR-engine van een extensie (js/pdf/ocr-engines.js, #970);
+  // null = de ingebouwde Tesseract.
+  ocrEngine: null,
+  // Extensiecatalogus (#969): eigen catalogus-links (de standaard van het
+  // project staat altijd vooraan, zie js/plugins/extension-catalog.js) en de
+  // bron per geïnstalleerde extensie.
+  extensionCatalogs: [],
+  extensionSources: {},
+
+  // General — authorName defaults to '' (resolved to OS username at load time)
+  authorName: '',
+
+  // Zoeken: beide bronnen staan standaard aan
+  searchInText: true,
+  searchInAnnotations: true,
+
+  // Snapping — 45 means Shift snaps to 0/45/90/135…: horizontaal,
+  // verticaal én diagonaal.
+  angleSnapDegrees: 45,
+  enableAngleSnap: true,
+
+  // Grid snapping (gridSize is in user units = mm by default — converted to
+  // app pixels via getMeasureScale at draw / snap time)
+  gridSize: 10,
+  enableGridSnap: false,
+  showGrid: false,
+
+  // Polar tracking (CAD-style angular guide while drawing)
+  polarTrackingEnabled: false,
+  polarIncrement: 45,        // degrees
+  polarTolerance: 3,         // degrees of tolerance to engage snap
+
+  // Object snapping
+  enableObjectSnap: true,
+  snapToEndpoints: true,
+  snapToMidpoints: true,
+  snapToCenters: true,
+  // Vertex = elk tussenpunt van een polylijn/veelhoek (los van de
+  // eindpunten). Start point = het eerste punt waarmee het object is
+  // getekend (lijnstart, eerste polylijnpunt, eerste hoek).
+  snapToVertices: true,
+  snapToStartPoints: true,
+  snapToEdges: false,
+  snapToIntersections: true,
+  snapToPerpendicular: false,
+  snapToQuadrant: false,
+  snapToTangent: false,
+  snapToNearest: false,
+  showSnapTypeLabel: true,
+  objectSnapRadius: 12,
+  snapToPdfContent: true,
+  // Alignment snapping for image annotations: while moving an image, its
+  // edges/centres snap to the edges/centres of OTHER images (design-tool style
+  // guide lines); while resizing, its width/height snaps to another image's
+  // width/height ("equal width"). Uses objectSnapRadius as its tolerance.
+  enableImageAlignSnap: true,
+  // Move inference (#519, G / mv): tracking lines through points of other
+  // geometry (and acquired points), extension lines of lines / wall faces,
+  // and parallel / perpendicular guides. Polar during a move follows the
+  // polar-tracking settings above.
+  moveInferenceTracking: true,
+  moveInferenceExtension: true,
+  moveInferenceParallel: true,
+  // CAD behavior — keep drawing tool active after committing one annotation
+  // so the user can place multiple in a row without re-selecting the tool.
+  // Esc returns to select.
+  keepToolActive: true,
+
+  // Line tool 'continue' mode: after placing a line, the next line starts at
+  // the previous line's endpoint (chained segments) until Esc/right-click.
+  // Off by default. Toggled by a checkbox on the line tool. Reuses the same
+  // chain mechanism as the wall tool.
+  lineContinue: false,
+
+  // Ribbon collapsed state: when true the ribbon body is hidden and only the
+  // tab strip is shown (toggled by the chevron at the end of the tab strip).
+  ribbonCollapsed: false,
+
+  // Appearance
+  defaultAnnotationColor: '#FF0000',
+  defaultLineWidth: 2,
+  defaultFontSize: 16,
+  highlightOpacity: 50,
+
+  // TextBox defaults — witte achtergrond, zodat een tekstvak op een drukke
+  // (CAD-)ondergrond leesbaar is zonder eerst een vulling aan te zetten.
+  textboxFillColor: '#FFFFFF',
+  textboxFillNone: false,
+  textboxStrokeColor: '#FF0000',
+  textboxBorderWidth: 1,
+  textboxBorderStyle: 'solid',
+  textboxOpacity: 100,
+  textboxFontSize: 8,
+  textboxFontFamily: 'Arial',
+
+  // Callout defaults
+  calloutFillColor: '#FFFBEB',
+  calloutFillNone: false,
+  calloutStrokeColor: '#FF0000',
+  calloutBorderWidth: 1,
+  calloutBorderStyle: 'solid',
+  calloutOpacity: 100,
+  calloutFontSize: 14,
+  calloutFontFamily: 'Arial',
+
+  // Rectangle defaults
+  rectFillColor: '#FFFBEB',
+  rectFillNone: true,
+  rectStrokeColor: '#FF0000',
+  rectBorderWidth: 1,
+  rectBorderStyle: 'solid',
+  rectOpacity: 100,
+
+  // Circle/Ellipse defaults
+  circleFillColor: '#FFFBEB',
+  circleFillNone: true,
+  circleStrokeColor: '#FF0000',
+  circleBorderWidth: 1,
+  circleBorderStyle: 'solid',
+  circleOpacity: 100,
+
+  // Arrow defaults
+  arrowFillColor: '#FF0000',
+  arrowFillNone: true,
+  arrowStrokeColor: '#FF0000',
+  arrowLineWidth: 2,
+  arrowBorderStyle: 'solid',
+  arrowStartHead: 'none',
+  arrowEndHead: 'open',
+  arrowHeadSize: 10,
+  arrowOpacity: 100,
+
+  // Draw/Freehand defaults
+  drawStrokeColor: '#FF0000',
+  drawLineWidth: 2,
+  drawOpacity: 100,
+  // Drukgevoelige inkt (#385): pendruk stuurt de breedte (een muis blijft
+  // vast), minimale breedte in % van de lijndikte, gladheid 0..100, en
+  // alleen de pen tekent (aanraking genegeerd).
+  drawPressure: true,
+  drawPressureMinWidth: 30,
+  drawSmoothing: 50,
+  drawPenOnly: false,
+
+  // Line defaults
+  lineStrokeColor: '#FF0000',
+  lineLineWidth: 2,
+  lineBorderStyle: 'solid',
+  lineOpacity: 100,
+
+  // Highlight defaults
+  highlightColor: '#FFFF00',
+
+  // Polygon defaults
+  polygonFillColor: '#FFFBEB',
+  polygonFillNone: true,
+  polygonStrokeColor: '#FF0000',
+  polygonLineWidth: 2,
+  polygonBorderStyle: 'solid',
+  polygonOpacity: 100,
+
+  // Cloud defaults
+  cloudFillColor: '#FFFBEB',
+  cloudFillNone: true,
+  cloudStrokeColor: '#FF0000',
+  cloudLineWidth: 2,
+  cloudBorderStyle: 'solid',
+  cloudOpacity: 100,
+
+  // Cloud Polyline defaults
+  cloudPolylineStrokeColor: '#FF0000',
+  cloudPolylineLineWidth: 2,
+  cloudPolylineOpacity: 100,
+
+  // Comment/Note defaults
+  commentColor: '#FFFF00',
+  commentIcon: 'comment',
+
+  // Polyline defaults
+  polylineStrokeColor: '#FF0000',
+  polylineLineWidth: 2,
+  polylineBorderStyle: 'solid',
+  polylineOpacity: 100,
+
+  // Redaction defaults
+  redactionOverlayColor: '#000000',
+
+  // Measurement global
+  measureRounding: 'none', // 'none', '1', '5', '10'
+  measureCtrlSnap: 10,
+  // Getalnotatie van maten (#629): 'auto' volgt de taal (nl: komma),
+  // 'comma' / 'point' overschrijven het decimaalteken.
+  measureDecimalNotation: 'auto',
+  measureDigitGrouping: false,
+  // Schaalcontrole (#629): drempels in procenten.
+  scaleCheckOkPercent: 0.5,
+  scaleCheckWarnPercent: 2,
+
+  // Measure Distance defaults
+  measureDistStrokeColor: '#FF0000',
+  measureDistLineWidth: 2,
+  measureDistBorderStyle: 'solid',
+  measureDistOpacity: 100,
+  measureDistStartHead: 'openCircle',
+  measureDistEndHead: 'openCircle',
+  measureDistHeadSize: 12,
+  measureDistDimScale: 1,
+  measureDistDimUnit: 'mm',
+  measureDistDimPrecision: 0,
+
+  // Measure Area defaults
+  measureAreaStrokeColor: '#0000FF',
+  measureAreaFillColor: '#0000FF',
+  measureAreaFillNone: true,
+  measureAreaLineWidth: 2,
+  measureAreaBorderStyle: 'solid',
+  measureAreaOpacity: 100,
+  measureAreaDimScale: 1,
+  measureAreaDimUnit: 'mm',
+  measureAreaDimPrecision: 2,
+  // Lengte van elke rechte zijde tonen (#536); standaard uit.
+  measureAreaShowEdgeLengths: false,
+
+  // Filled Area defaults (user-drawn contour with arcs + holes, solid + hatch fill)
+  filledAreaStrokeColor: '#000000',
+  filledAreaFillColor: '#cccccc',
+  filledAreaFillNone: false,
+  filledAreaLineWidth: 1,
+  filledAreaBorderStyle: 'solid',
+  filledAreaOpacity: 100,
+  filledAreaHatchPattern: 'none',
+  filledAreaHatchColor: '#000000',
+  filledAreaHatchScale: 100,
+  filledAreaHatchAngle: 0,
+
+  // Measure Perimeter defaults
+  measurePerimStrokeColor: '#0000FF',
+  measurePerimLineWidth: 2,
+  measurePerimBorderStyle: 'solid',
+  measurePerimOpacity: 100,
+  measurePerimStartHead: 'none',
+  measurePerimEndHead: 'none',
+  measurePerimHeadSize: 12,
+  measurePerimDimScale: 1,
+  measurePerimDimUnit: 'mm',
+  measurePerimDimPrecision: 2,
+
+  // Behavior
+  autoSelectAfterCreate: true,
+  confirmBeforeDelete: true,
+  wheelZoomWithoutCtrl: false,
+  // Dubbelklik met de middelste muisknop = huidige pagina passend (#767).
+  middleDoubleClickFit: true,
+  // Muiswiel boven het lint wisselt van tabblad (#852).
+  ribbonWheelSwitchesTabs: true,
+
+  // Startup
+  restoreLastSession: false,
+  dontAskDefaultPdf: false,
+
+  // Screenshot annotate: intercept the system PrtScn key as a global hotkey
+  // (opt-in; off by default because a global hotkey is intrusive).
+  interceptPrintScreen: false,
+
+  // Home → Screenshot: the last choices in the capture dialog (resolution
+  // 'screen' = what the view shows, or a dpi; copy or save on Enter).
+  screenshotResolution: 'screen',
+  screenshotCustomDpi: 300,
+  screenshotFormat: 'png',
+  screenshotJpegQuality: 90,
+  screenshotDefaultAction: 'copy',
+
+  // AI-koppeling (MCP): standaard aan, zodat een AI-assistent meteen kan
+  // koppelen. De koppeling luistert alleen op deze computer (127.0.0.1) en is
+  // uit te zetten in Instellingen → Algemeen. Wie de koppeling eerder uitzette,
+  // houdt die keuze (opgeslagen waarden winnen van de standaard).
+  ...MCP_STANDAARD,
+
+  // Display
+  showHandles: true,
+  handleSize: 8,
+
+  // View
+  thinLines: false,
+  // Read aloud (#384): voice id ('' = the engine's default) and rate (1 = normal).
+  readAloudVoice: '',
+  readAloudRate: 1,
+  // Online voices send the text being read to an online speech service:
+  // only after the user opts in.
+  readAloudAllowOnline: false,
+  showScrollbars: false,
+  // Background color around and between the pages in the document view
+  // (#859): '' = the default (light grey #e0e0e0, the theme around continuous
+  // pages), or '#rrggbb'. Display only: never the page, print or export.
+  pageBackgroundColor: '',
+  // Zware raster-pagina's (grote content-stream, bv. CAD-tekeningen met
+  // miljoenen segmenten) progressief tegel-voor-tegel invullen via de
+  // multi-proces worker-pool: parallelle eerste render (sneller), geen
+  // zwart scherm, hoofdthread blijft vrij. Uitzetbaar in Voorkeuren.
+  progressiveRender: true,
+  // Incrementeel opslaan (#679): annotatie- en formulierwijzigingen achter de
+  // bestaande bytes toevoegen in plaats van het hele bestand te herschrijven.
+  // Experimenteel en standaard uit (docs/incrementeel-opslaan.md); wat niet
+  // zeker past, wordt altijd volledig herschreven.
+  incrementalSave: false,
+  // Schermkalibratie voor Werkelijke grootte (#520): CSS-pixels per inch per
+  // schermschaal ({ "1.25": 120.5 }). Gekalibreerd scherm: 100% is de echte
+  // papiermaat. Leeg = niet gekalibreerd, dan bepaalt zoomDpi wat 100% is.
+  screenCalibration: {},
+  // Screen resolution (dpi) that defines 100% zoom on a screen without a
+  // calibration (screenCalibration wins when this screen has one).
+  zoomDpi: 110,
+  // Page text sharpening 0-4 (0 = as rendered).
+  pageSharpen: 2,
+  // Unit for paper sizes in the properties panel (image width/height, scale
+  // bar height): 'mm' | 'cm' | 'in' | 'pt' (#598). Display only — the model
+  // stays in page points.
+  paperSizeUnit: 'pt',
+  // Keyboard shortcuts changed by the user (#714): only the commands whose
+  // shortcuts differ from the defaults, { 'view.fitPage': ['Ctrl+K'] }.
+  // See core/keybindings/registry.js.
+  keyboardShortcuts: {},
+
+  // Panels
+  // Indeling van de werkruimte (#932, core/werkruimte.js): blijft over een
+  // herstart bewaard. leftPanelWidth null = de breedte uit het stijlblad.
+  leftPanelCollapsed: false,
+  leftPanelTab: 'thumbnails',
+  leftPanelWidth: null,
+  propertiesPanelCollapsed: false,
+  // Werkruimten met een naam: [{ naam, layout }], en de laatst gekozen.
+  workspaces: [],
+  activeWorkspace: '',
+  propertiesPanelVisible: true,
+  toolPaletteVisible: true,
+  toolPaletteMode: 'docked-left',
+  toolPaletteFloatX: 200,
+  toolPaletteFloatY: 150,
+
+  paletteLeftOrder: [],
+  paletteRightOrder: [],
+
+  // Symbol palette
+  symbolPaletteVisible: true,
+  symbolPaletteMode: 'docked-right',
+  symbolPaletteFloatX: 300,
+  symbolPaletteFloatY: 150,
+  customSymbolGroups: [],
+  disabledSymbolGroups: [],
+  parametricSymbolDefaults: {},
+
+  // NL IFC-tekenlaag: tekeningtypen worden lazy geseed door
+  // annotations/drafting-rules.js (migratieketen in js/drafting/tekeningtype.js).
+  tekeningtypen: null,
+  // User-edited symbol type geometry overrides, keyed by a hash of the
+  // original symbol SVG. Each entry: { svg, name }. Applied whenever a stamp
+  // of that type is placed or re-rendered.
+  symbolTypeOverrides: {},
+
+  // Schedule
+  scheduleTemplates: [],
+
+  // Feedback
+  feedbackEmail: '',
+  feedbackFullName: '',
+
+  // Language
+  language: 'auto',
+
+  // What's New dialog — last release version the user has acknowledged
+  lastSeenReleaseVersion: '',
+
+  // Print dialog — settings of the last print action (null = dialog defaults)
+  printSettings: null,
+
+  // CAD export/import (#400) — last used settings (null = dialog defaults)
+  cadExportSettings: null,
+  cadImportSettings: null,
+  cadImportPresets: null,
+
+  // PDF/X export (#422) — last chosen output profile and rendering intent
+  // (null = sRGB without conversion, relative colorimetric)
+  pdfxSettings: null
+};

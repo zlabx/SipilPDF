@@ -1,0 +1,52 @@
+// Prevents the additional console window on Windows, DO NOT REMOVE!!
+// Unconditional (also debug builds): the app must run fully in the
+// background with only its own window. Dev logs stay visible when launched
+// from a terminal (`tauri dev` pipes stdio); double-click runs log nothing,
+// startup failures still land in the app-local startup diagnostics file.
+#![windows_subsystem = "windows"]
+
+use clap::Parser;
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "open-pdf-studio", version)]
+struct Cli {
+    /// Start an in-process MCP server on `--mcp-port` (default 9223). Off by default.
+    /// Production builds refuse to start the server unless OPS_ENABLE_MCP=1.
+    #[arg(long, default_value_t = false)]
+    mcp_server: bool,
+
+    /// Port for the MCP server (only used when --mcp-server is set).
+    #[arg(long, default_value_t = 9223)]
+    mcp_port: u16,
+}
+
+fn main() {
+    // Draagbare modus (#881): als eerste, want hij zet omgevingsvariabelen
+    // (gegevensmap, WebView2-profiel) die alles hierna leest.
+    let draagbaar = app_lib::draagbaar::activeer();
+    if draagbaar.portable {
+        eprintln!("[startup] portable mode, data in {:?}", draagbaar.data_dir);
+        app_lib::draagbaar::controleer_webview2();
+    }
+    // Before GTK/WebKit start threads: no realtime IPC threads that the
+    // kernel can SIGKILL the app for while zooming (#924).
+    app_lib::linux_runtime::disable_realtime_threads();
+    app_lib::linux_runtime::configure_appimage_gio_modules();
+    // OpenAEC Linux and other machines without GPU or X server (#863): detect
+    // the environment and set the WebKitGTK/GDK variables before GTK starts.
+    app_lib::openaec_omgeving::bereid_proces_voor();
+
+    // Tauri swallows unrecognized args (e.g. file-association launches), so we
+    // try_parse rather than parse so unknown args don't abort startup.
+    let args: Vec<String> = std::env::args().collect();
+    app_lib::openaec_omgeving::stop_zonder_beeldscherm(&args);
+    let cli = Cli::try_parse_from(&args).unwrap_or(Cli {
+        mcp_server: false,
+        mcp_port: 9223,
+    });
+
+    app_lib::run(app_lib::StartupOpts {
+        mcp_server: cli.mcp_server,
+        mcp_port: cli.mcp_port,
+    });
+}

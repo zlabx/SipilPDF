@@ -1,0 +1,596 @@
+import { PDFName, PDFDict, PDFRef, PDFRawStream, decodePDFRawStream } from 'pdf-lib';
+import { kruisEindpuntenEllips } from '../../annotations/kruis-geometrie.js';
+import { hasFill, hasStroke, colorWithoutStroke, kanZonderRand } from '../../annotations/fill-utils.js';
+import { vlakOmhullende } from '../../annotations/vlak-ringen.js';
+import { blendPdfNaam } from '../../annotations/blend-modes.js';
+import { hatchFillOps, dashArrayForStyle } from './appearance-vectors.js';
+import { eigenVulDekking } from '../../annotations/vul-dekking.js';
+import { STANDAARD_FONTS, tekstvakFontSoort } from './tekstvak-fontnaam.js';
+
+/** Heeft de vorm een arcering uit het eigenschappenpaneel (#621)? */
+function heeftArcering(ann) {
+  return !!ann?.hatchPattern && ann.hatchPattern !== 'none';
+}
+
+/**
+ * Arcering van een rechthoek of ellips in de appearance (#621), in de eigen
+ * ruimte van de stream: oorsprong linksonder, y omhoog, het vak 0 0 w h. De
+ * punten zijn de omtrek in app-coördinaten van het vak.
+ */
+function vormArcering(ann, punten, w, h) {
+  if (!heeftArcering(ann)) return '';
+  const X = (x) => x - ann.x;
+  const Y = (y) => ann.y + h - y;
+  return metVulGs(ann, hatchFillOps({
+    points: punten, holes: null, hatchPattern: ann.hatchPattern,
+    hatchColorRgb: hexToRgb(ann.hatchColor || ann.strokeColor || ann.color || '#000000'),
+    hatchScale: ann.hatchScale, hatchAngle: ann.hatchAngle, X, Y,
+  }));
+}
+
+/** Naam van de graphics-state voor de arcering van een vorm met eigen vul-dekking. */
+export const VUL_GS_NAAM = 'GSv';
+
+/**
+ * Arcering onder de vul-dekking (#685): de arcering hoort bij de vulling,
+ * maar bestaat uit lijnen (/CA). Bij een eigen vul-dekking gaat ze daarom in
+ * q…Q met /GSv (CA en ca op de vul-dekking); zetDoorzichtigheidInAp legt die
+ * graphics-state in de resources. Zonder eigen vul-dekking ongewijzigd.
+ */
+export function metVulGs(ann, ops) {
+  if (!ops || eigenVulDekking(ann) === null) return ops;
+  return `q\n/${VUL_GS_NAAM} gs\n${ops}Q\n`;
+}
+
+/** De ellips van een vak als veelhoek in app-coördinaten (voor de arcering). */
+function ellipsPunten(ann, w, h, n = 72) {
+  const cx = ann.x + w / 2, cy = ann.y + h / 2;
+  return [...Array(n)].map((_, i) => {
+    const a = (i / n) * 2 * Math.PI;
+    return { x: cx + (w / 2) * Math.cos(a), y: cy + (h / 2) * Math.sin(a) };
+  });
+}
+
+// Convert hex color to RGB values (0-1 range)
+export function hexToRgb(hex) {
+  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  if (!result) return [0, 0, 0];
+  return [
+    parseInt(result[1], 16) / 255,
+    parseInt(result[2], 16) / 255,
+    parseInt(result[3], 16) / 255
+  ];
+}
+
+// Build a BS (Border Style) dictionary. /BS /D is the pattern the screen
+// draws (rendering/decorations.js applyBorderStyle) and the appearances write
+// (appearance-vectors.js dashArrayForStyle), so a reader that rebuilds the
+// appearance from /BS shows the same line. Solid → no /D; style stays 'S'.
+// Extended (dash-dot) styles used to fall through to solid (issue #256).
+// Older versions wrote dashed as [8 4] and dotted as [2 2]; the loader
+// (loader/color-extraction.js) still reads both.
+export function buildBorderStyle(context, width, borderStyle) {
+  const dash = dashArrayForStyle(borderStyle);
+  const bs = { Type: 'Border', W: width, S: dash ? 'D' : 'S' };
+  if (dash) bs.D = dash;
+  return context.obj(bs);
+}
+
+/** Dash operator for an appearance stream ('' for a solid line). */
+export function streepOperator(borderStyle) {
+  const dash = dashArrayForStyle(borderStyle);
+  return dash ? `[${dash.join(' ')}] 0 d\n` : '';
+}
+
+// Vormen waarvan de rand via "geen rand" (strokeColor 'none') weg kan — de
+// soorten waarvoor rendering.js de omtrek met hasStroke() overslaat. De waarde
+// is de sleutel van de randkleur in het annotatie-woordenboek: /C, behalve bij
+// FreeText, waar /C de vulling is en /IC de rand (zie saver.js en de loader).
+const RANDSLEUTEL = {
+  box: 'C', circle: 'C', polygon: 'C', cloud: 'C', filledArea: 'C', measureArea: 'C',
+  textbox: 'IC', callout: 'IC',
+};
+
+// Sleutel van de randkleur als deze annotatie zonder rand opgeslagen moet
+// worden, anders null (vorm mét rand, of een soort zonder weglaatbare rand).
+export function randSleutelZonderRand(ann) {
+  if (!ann || hasStroke(ann.strokeColor) || !kanZonderRand(ann.type)) return null;
+  return RANDSLEUTEL[ann.type] || null;
+}
+
+// Onzichtbaar vlak (#435): de loader merkt een vorm zo aan als het BESTAND
+// uitdrukkelijk lijndikte 0 opgeeft, zonder randkleur en zonder vulling (zie
+// loader/geen-rand.js) — zoals een tekenpakket zijn doorzoekbare tekst
+// wegschrijft. Elke lezer toont daar niets. Het scherm tekent er een dunne
+// hulplijn omheen zodat het vlak vindbaar blijft (rendering.js maakt de
+// lijndikte dan 0,5), maar die hulplijn hoort niet in de appearance: als
+// haarlijn (`0 w ... re S`) zou hij het vlak in élke lezer zichtbaar maken.
+//
+// Geeft de gebruiker het vlak alsnog een lijndikte of een vulling, dan is het
+// niet langer onzichtbaar en wordt het gewoon getekend.
+export function onzichtbaarVlak(ann) {
+  return !!ann && ann.onzichtbaarVlak === true && ann.lineWidth === 0 && !hasFill(ann.fillColor);
+}
+
+// Vorm zonder rand in het annotatie-woordenboek (#431). Elke lezer moet hem
+// zonder omtrek tonen: de randkleur gaat eruit en /BS krijgt /W 0 (de lijnstijl
+// /S en /D blijven). Wat de app nodig heeft voor een exacte rondgang staat in
+// de eigen sleutel /OPS_NoStroke << /W lijndikte /C kleur >>: de lijndikte-
+// instelling (de /W die er met rand had gestaan) en de eigen kleur van de
+// annotatie, waarin kruis, aanhaallijn en maatlabel getekend worden.
+export function markeerZonderRand(context, annotDict, ann, randSleutel) {
+  const bewaard = {};
+  const bsRaw = annotDict.get(PDFName.of('BS'));
+  const bs = bsRaw ? context.lookup(bsRaw) : null;
+  const w = bs ? context.lookup(bs.get(PDFName.of('W'))) : null;
+  if (w && typeof w.asNumber === 'function') bewaard.W = w.asNumber();
+  if (bs) bs.set(PDFName.of('W'), context.obj(0));
+  else annotDict.set(PDFName.of('BS'), buildBorderStyle(context, 0, ann.borderStyle));
+  annotDict.delete(PDFName.of(randSleutel));
+  if (hasFill(ann.color)) bewaard.C = hexToRgb(ann.color);
+  annotDict.set(PDFName.of('OPS_NoStroke'), context.obj(bewaard));
+}
+
+// /Rect van een vlak-annotatie (meetvlak / getekend vlak), in PDF-coördinaten.
+// De omhullende loopt over ÁLLE ringen, dus ook over een tweede deel dat naast
+// de buitenring ligt. Eerder telde alleen `points` mee: zo'n deel viel dan
+// buiten de /Rect — en daarmee buiten de /BBox van de appearance, waardoor een
+// andere lezer het wegknipte (GitHub #457).
+export function vlakRect(ann, X, Y, pad = 2) {
+  const grens = vlakOmhullende(ann.points, ann.holes);
+  if (!grens) return [0, 0, 0, 0];
+  const xs = [X(grens.minX), X(grens.maxX)];
+  const ys = [Y(grens.minY), Y(grens.maxY)];
+  return [
+    Math.min(...xs) - pad, Math.min(...ys) - pad,
+    Math.max(...xs) + pad, Math.max(...ys) + pad,
+  ];
+}
+
+// Compute annotation flags (F entry) from annotation properties
+export function computeAnnotFlags(ann) {
+  let flags = 0;
+  if (ann.printable !== false) flags |= 4;   // Bit 3: Print (default on)
+  if (ann.readOnly) flags |= 64;              // Bit 7: ReadOnly
+  if (ann.locked) flags |= 128;               // Bit 8: Locked
+  return flags;
+}
+
+// Fontnamen van tekstvakken (pure functies, ook voor de UI): zie
+// tekstvak-fontnaam.js.
+export { mapFontToPdfName, isTekstStandaardFont, vervangendeStandaardFont } from './tekstvak-fontnaam.js';
+
+/**
+ * Het fontwoordenboek voor een tekstvak-appearance (#512). Een niet-standaard
+ * font is niet ingebed; zonder FontDescriptor vervangt MuPDF het door een
+ * schreefletter. Een descriptor zonder Serif-vlag laat lezers die het font niet
+ * hebben een schreefloze letter kiezen, met vet en cursief uit de naam.
+ * @param {string} naam  PDF-fontnaam van mapFontToPdfName
+ */
+export function tekstvakFontDict(context, naam) {
+  const font = { Type: 'Font', Subtype: 'Type1', BaseFont: naam, Encoding: 'WinAnsiEncoding' };
+  if (STANDAARD_FONTS.test(naam)) return context.obj(font);
+  const { vet, cursief, mono, schreef } = tekstvakFontSoort(naam);
+  font.FontDescriptor = context.register(context.obj({
+    Type: 'FontDescriptor',
+    FontName: naam,
+    // 1 vaste breedte, 2 schreef, 32 niet-symbolisch, 64 cursief, 262144 vet (ForceBold).
+    Flags: (mono ? 1 : 0) | (schreef ? 2 : 0) | 32 | (cursief ? 64 : 0) | (vet ? 262144 : 0),
+    ItalicAngle: cursief ? -12 : 0,
+    FontBBox: [-200, -250, 1200, 950],
+    Ascent: 950,
+    Descent: -250,
+    CapHeight: 700,
+    StemV: vet ? 140 : 80,
+  }));
+  return context.obj(font);
+}
+
+// Ensure AcroForm Default Resources contain fonts used by FreeText annotations
+// so DA strings can reference them (e.g. /Helv, /Courier, /SegoeUI)
+export function ensureAcroFormFonts(pdfDoc, context, usedFonts) {
+  const catalog = context.lookup(context.trailerInfo.Root);
+  if (!catalog) return;
+
+  // Get or create AcroForm dictionary
+  let acroFormRef = catalog.get(PDFName.of('AcroForm'));
+  let acroForm;
+  if (acroFormRef) {
+    acroForm = context.lookup(acroFormRef);
+  }
+  if (!acroForm) {
+    acroForm = context.obj({ Fields: [] });
+    acroFormRef = context.register(acroForm);
+    catalog.set(PDFName.of('AcroForm'), acroFormRef);
+  }
+
+  // Get or create DR (Default Resources) dictionary
+  let drRef = acroForm.get(PDFName.of('DR'));
+  let dr;
+  if (drRef) {
+    dr = context.lookup(drRef);
+  }
+  if (!dr) {
+    dr = context.obj({});
+    acroForm.set(PDFName.of('DR'), dr);
+  }
+
+  // Get or create Font dictionary within DR
+  let fontDictRef = dr.get(PDFName.of('Font'));
+  let fontDict;
+  if (fontDictRef) {
+    fontDict = context.lookup(fontDictRef);
+  }
+  if (!fontDict) {
+    fontDict = context.obj({});
+    dr.set(PDFName.of('Font'), fontDict);
+  }
+
+  // Add standard 14 fonts
+  const standardFonts = [
+    'Helv', 'Helvetica', 'Helvetica-Bold', 'Helvetica-Oblique', 'Helvetica-BoldOblique',
+    'Courier', 'Courier-Bold', 'Courier-Oblique', 'Courier-BoldOblique',
+    'Times-Roman', 'Times-Bold', 'Times-Italic', 'Times-BoldItalic'
+  ];
+  const baseFontMap = { 'Helv': 'Helvetica' };
+
+  for (const fontName of standardFonts) {
+    if (!fontDict.get(PDFName.of(fontName))) {
+      const baseFont = baseFontMap[fontName] || fontName;
+      fontDict.set(PDFName.of(fontName), context.obj({
+        Type: 'Font',
+        Subtype: 'Type1',
+        BaseFont: baseFont,
+        Encoding: 'WinAnsiEncoding'
+      }));
+    }
+  }
+
+  // Also register any non-standard fonts actually used by annotations
+  // (e.g. "SegoeUI", "SegoeUI-Bold") so viewers can resolve the DA font reference
+  if (usedFonts) {
+    for (const fontName of usedFonts) {
+      if (!fontDict.get(PDFName.of(fontName))) {
+        fontDict.set(PDFName.of(fontName), context.obj({
+          Type: 'Font',
+          Subtype: 'TrueType',
+          BaseFont: fontName,
+          Encoding: 'WinAnsiEncoding'
+        }));
+      }
+    }
+  }
+}
+
+// Strip PDF/A conformance from XMP metadata so the saved file
+// is not falsely reported as PDF/A after modifications. A document the user
+// chose to keep as PDF/A is converted again afterwards (pdf/pdfa/, #379).
+export function stripPdfAMetadata(pdfDocLib) {
+  try {
+    const catalog = pdfDocLib.catalog;
+    const metadataRef = catalog.get(PDFName.of('Metadata'));
+    if (!metadataRef) return;
+
+    const metadataObj = pdfDocLib.context.lookup(metadataRef);
+    if (!(metadataObj instanceof PDFRawStream) && typeof metadataObj?.getContents !== 'function') return;
+
+    // Decoded bytes: the stream may be compressed.
+    const xmlBytes = metadataObj instanceof PDFRawStream
+      ? decodePDFRawStream(metadataObj).decode()
+      : metadataObj.getContents();
+    let xml = new TextDecoder().decode(xmlBytes);
+
+    // Remove pdfaid:part and pdfaid:conformance elements (and attribute form)
+    xml = xml.replace(/<pdfaid:part>[^<]*<\/pdfaid:part>/g, '');
+    xml = xml.replace(/<pdfaid:conformance>[^<]*<\/pdfaid:conformance>/g, '');
+    xml = xml.replace(/\s(pdfaid:(?:part|conformance|amd|rev))\s*=\s*(["'])[^"']*\2/g, '');
+
+    // Remove empty pdfaid Description blocks left behind
+    xml = xml.replace(/<rdf:Description[^>]*xmlns:pdfaid[^>]*>\s*<\/rdf:Description>/g, '');
+
+    // A new stream: pdf-lib streams cannot change their contents in place.
+    const stream = pdfDocLib.context.stream(new TextEncoder().encode(xml), { Type: 'Metadata', Subtype: 'XML' });
+    if (metadataRef instanceof PDFRef) pdfDocLib.context.assign(metadataRef, stream);
+    else catalog.set(PDFName.of('Metadata'), pdfDocLib.context.register(stream));
+  } catch (e) {
+    console.warn('Failed to strip PDF/A metadata:', e);
+  }
+}
+
+/**
+ * Zet de doorzichtigheid van een annotatie ook ín haar appearance stream (#512).
+ * PDFium (ook in browsers) en MuPDF negeren /CA zodra er een /AP is; andere
+ * programma's schrijven de alfa daarom óók als ExtGState in de stream. `/GSo gs`
+ * komt vóór al het tekenwerk; een aparte vul-alfa (GSf) daarna blijft gelden,
+ * net als op het scherm. /CA op de annotatie zelf blijft staan.
+ *
+ * Met `alsGroep` gaat de inhoud ongewijzigd in een transparantiegroep die één
+ * keer met de alfa getekend wordt: overlappende delen (schacht en kop van een
+ * pijl) worden dan niet donkerder, zoals op het scherm.
+ *
+ * Een mengmodus (#614) gaat als /BM in dezelfde graphics-state, ook bij
+ * volledige dekking. Normaal schrijft niets: dat is de standaard. De
+ * niet-scheidbare modi (Hue … Luminosity) vragen niets extra's; /OP en /OPM
+ * gaan over overdrukken, niet over mengen. /BM komt bewust niet ook op de
+ * annotatie-dict (PDF 2.0): een lezer die beide toepast, mengt dubbel.
+ */
+export function zetDoorzichtigheidInAp(context, annotDict, opacity, { alsGroep = false, blendMode = null, vulOpacity = null } = {}) {
+  // Eigen vul-dekking (#685): /ca in dezelfde graphics-state, plus /GSv voor
+  // de arcering (zie metVulGs). Gelijk aan de lijn is het één dekking.
+  const vul = typeof vulOpacity === 'number' && vulOpacity >= 0 && vulOpacity <= 1 && vulOpacity !== opacity
+    ? vulOpacity : null;
+  const alfa = (opacity >= 0 && opacity < 1) || vul !== null;
+  const bm = blendPdfNaam(blendMode);
+  if (!alfa && !bm) return;
+  const apRaw = annotDict.get(PDFName.of('AP'));
+  const ap = apRaw && context.lookup(apRaw);
+  const nRef = ap?.get?.(PDFName.of('N'));
+  const n = nRef && context.lookup(nRef);
+  if (!n?.dict) return;
+  const oud = n instanceof PDFRawStream ? decodePDFRawStream(n).decode()
+    : typeof n.getUnencodedContents === 'function' ? n.getUnencodedContents() : n.getContents();
+  const metKop = (kopTekst, rest) => {
+    const kop = new TextEncoder().encode(kopTekst);
+    const uit = new Uint8Array(kop.length + rest.length);
+    uit.set(kop, 0);
+    uit.set(rest, kop.length);
+    return uit;
+  };
+
+  const dict = {};
+  for (const [sleutel, waarde] of n.dict.entries()) {
+    const naam = sleutel.asString();
+    if (naam === '/Filter' || naam === '/DecodeParms' || naam === '/Length') continue;
+    dict[naam.slice(1)] = waarde;
+  }
+  const gsVelden = { Type: 'ExtGState' };
+  if (alfa) { gsVelden.CA = opacity; gsVelden.ca = vul ?? opacity; }
+  if (bm) gsVelden.BM = PDFName.of(bm);
+  const gso = context.obj(gsVelden);
+  const resOud = n.dict.get(PDFName.of('Resources'));
+  const res = context.lookup(resOud);
+
+  let inhoud;
+  if (alsGroep) {
+    // Zelfde ruimte als de buitenste stream (geen eigen Matrix), alfa 1.
+    const groep = context.flateStream(oud, {
+      Type: 'XObject', Subtype: 'Form', BBox: n.dict.get(PDFName.of('BBox')),
+      Resources: resOud || context.obj({}),
+      Group: context.obj({ Type: 'Group', S: 'Transparency' }),
+    });
+    dict.Resources = context.obj({
+      ExtGState: context.obj({ GSo: gso }),
+      XObject: context.obj({ OPSg: context.register(groep) }),
+    });
+    inhoud = new TextEncoder().encode('/GSo gs\n/OPSg Do\n');
+  } else {
+    const resNieuw = res instanceof PDFDict ? res.clone(context) : context.obj({});
+    const egsOud = resNieuw.get(PDFName.of('ExtGState'));
+    const egs = egsOud ? context.lookup(egsOud).clone(context) : context.obj({});
+    egs.set(PDFName.of('GSo'), gso);
+    if (vul !== null) {
+      egs.set(PDFName.of(VUL_GS_NAAM), context.obj({ Type: 'ExtGState', CA: vul, ca: vul }));
+    }
+    resNieuw.set(PDFName.of('ExtGState'), egs);
+    dict.Resources = resNieuw;
+    inhoud = metKop('/GSo gs\n', oud);
+  }
+
+  const nieuw = context.flateStream(inhoud, dict);
+  if (nRef instanceof PDFRef) context.assign(nRef, nieuw);
+  else ap.set(PDFName.of('N'), context.register(nieuw));
+}
+
+/**
+ * Begin- en eindhoek van een boog na de paginarotatie van de saver
+ * (_rotVisualMapper): die draait de pagina, dus de hoeken draaien mee
+ * (90 → θ − π/2, 180 → θ + π, 270 → θ + π/2). Zonder dit stond een boog op
+ * een gedraaide pagina een kwartslag om zijn middelpunt verdraaid.
+ */
+export function boogHoekenNaRotatie({ startAngle, endAngle }, rot) {
+  const r = ((rot % 360) + 360) % 360;
+  const d = r === 90 ? -Math.PI / 2 : r === 180 ? Math.PI : r === 270 ? Math.PI / 2 : 0;
+  return { startAngle: startAngle + d, endAngle: endAngle + d };
+}
+
+// Generate a PDF appearance stream (Form XObject) for an annotation
+export function generateAppearanceStream(context, ann, convertY) {
+  try {
+    let streamContent = '';
+    let bbox;
+
+    switch (ann.type) {
+      case 'mask': // wipeout — white-filled rect appearance, same path as box
+      case 'box': {
+        const w = ann.width;
+        const h = ann.height;
+        bbox = [0, 0, w, h];
+        const lw = ann.lineWidth ?? 2;
+        // Streeppatroon van rand en kruis, gelijk aan /BS /D (buildBorderStyle)
+        // en aan het scherm (rendering.js: applyBorderStyle vóór strokeRect en
+        // het kruis). Zonder deze d-operator tekenden andere lezers een
+        // gestreepte of gestippelde rechthoek doorgetrokken. Pas ná de
+        // arcering gezet: die tekent het scherm altijd doorgetrokken.
+        const vakStreep = streepOperator(ann.borderStyle);
+        // Geen rand (#431): alleen de vulling. Het kruis blijft, in de kleur
+        // waarin het scherm het tekent.
+        const vakArcering = ann.type === 'box' ? vormArcering(ann, [
+          { x: ann.x, y: ann.y }, { x: ann.x + w, y: ann.y },
+          { x: ann.x + w, y: ann.y + h }, { x: ann.x, y: ann.y + h }], w, h) : '';
+        if (randSleutelZonderRand(ann)) {
+          if (hasFill(ann.fillColor)) {
+            const [fr, fg, fb] = hexToRgb(ann.fillColor);
+            streamContent += `${fr} ${fg} ${fb} rg\n0 0 ${w} ${h} re f\n`;
+          }
+          streamContent += vakArcering;
+          if (ann.cross) {
+            const [kr, kg, kb] = hexToRgb(colorWithoutStroke(ann));
+            streamContent += `${lw} w\n${vakStreep}${kr} ${kg} ${kb} RG\n0 0 m ${w} ${h} l ${w} 0 m 0 ${h} l S\n`;
+          }
+          break;
+        }
+        const [r, g, b] = hexToRgb(ann.strokeColor || ann.color || '#000000');
+        // Onzichtbaar vlak (#435): het kader krijgt geen streek. `re n` legt
+        // vast dat er bewust niets geschilderd wordt, zodat geen enkele lezer
+        // er alsnog zelf een rand bij verzint.
+        if (onzichtbaarVlak(ann)) {
+          streamContent = `0 0 ${w} ${h} re n\n${vakArcering}`;
+          if (ann.type === 'box' && ann.cross) {
+            streamContent += `${lw} w\n${vakStreep}${r} ${g} ${b} RG\n0 0 m ${w} ${h} l ${w} 0 m 0 ${h} l S\n`;
+          }
+          break;
+        }
+        streamContent = `${lw} w\n${r} ${g} ${b} RG\n`;
+        // hasFill() en niet de waarheid van fillColor: de tekenwaarden 'none'
+        // en 'transparent' zijn waar, en hexToRgb() maakt er ZWART van — een
+        // vorm zonder vulling kreeg zo een zwart blok in zijn uiterlijk (#433),
+        // terwijl het annotatie-woordenboek er terecht geen /IC bij zette.
+        if (vakArcering) {
+          // Met arcering (#621): vulling, arcering, rand — de volgorde van het scherm.
+          if (hasFill(ann.fillColor)) {
+            const [fr, fg, fb] = hexToRgb(ann.fillColor);
+            streamContent += `${fr} ${fg} ${fb} rg\n0 0 ${w} ${h} re f\n`;
+          }
+          streamContent += `${vakArcering}${vakStreep}0 0 ${w} ${h} re S\n`;
+        } else if (hasFill(ann.fillColor)) {
+          const [fr, fg, fb] = hexToRgb(ann.fillColor);
+          streamContent += `${vakStreep}${fr} ${fg} ${fb} rg\n0 0 ${w} ${h} re B\n`;
+        } else {
+          streamContent += `${vakStreep}0 0 ${w} ${h} re S\n`;
+        }
+        if (ann.type === 'box' && ann.cross) {
+          streamContent += `0 0 m ${w} ${h} l ${w} 0 m 0 ${h} l S\n`;
+        }
+        break;
+      }
+      case 'circle': {
+        const w = ann.width || ann.radius * 2;
+        const h = ann.height || ann.radius * 2;
+        bbox = [0, 0, w, h];
+        const cx = w / 2, cy = h / 2;
+        const rx = w / 2, ry = h / 2;
+        const k = 0.5522847498; // Bezier approximation of circle
+        const lw = ann.lineWidth ?? 2;
+        // Streeppatroon van omtrek en kruis: zie de rechthoek hierboven.
+        const ellipsStreep = streepOperator(ann.borderStyle);
+        // Ellipse via Bezier curves
+        const ellips = `${cx} ${cy + ry} m\n`
+          + `${cx + k*rx} ${cy + ry} ${cx + rx} ${cy + k*ry} ${cx + rx} ${cy} c\n`
+          + `${cx + rx} ${cy - k*ry} ${cx + k*rx} ${cy - ry} ${cx} ${cy - ry} c\n`
+          + `${cx - k*rx} ${cy - ry} ${cx - rx} ${cy - k*ry} ${cx - rx} ${cy} c\n`
+          + `${cx - rx} ${cy + k*ry} ${cx - k*rx} ${cy + ry} ${cx} ${cy + ry} c\n`;
+        // Kruis (rond gat / sparing): ±45° door het middelpunt tot de omtrek.
+        let kruis = '';
+        if (ann.cross) {
+          for (const l of kruisEindpuntenEllips(cx, cy, rx, ry)) {
+            kruis += `${l.x1} ${l.y1} m ${l.x2} ${l.y2} l\n`;
+          }
+          kruis += 'S\n';
+        }
+        const ellipsArcering = vormArcering(ann, ellipsPunten(ann, w, h), w, h);
+        // Geen rand (#431): alleen de vulling; het kruis blijft, in de kleur
+        // waarin het scherm het tekent.
+        if (randSleutelZonderRand(ann)) {
+          if (hasFill(ann.fillColor)) {
+            const [fr, fg, fb] = hexToRgb(ann.fillColor);
+            streamContent += `${fr} ${fg} ${fb} rg\n${ellips}f\n`;
+          }
+          streamContent += ellipsArcering;
+          if (kruis) {
+            const [kr, kg, kb] = hexToRgb(colorWithoutStroke(ann));
+            streamContent += `${lw} w\n${ellipsStreep}${kr} ${kg} ${kb} RG\n${kruis}`;
+          }
+          break;
+        }
+        const [r, g, b] = hexToRgb(ann.strokeColor || ann.color || '#000000');
+        // Onzichtbaar vlak (#435): zie de rechthoek hierboven.
+        if (onzichtbaarVlak(ann)) {
+          streamContent = `${ellips}n\n${ellipsArcering}`;
+          if (kruis) streamContent += `${lw} w\n${ellipsStreep}${r} ${g} ${b} RG\n${kruis}`;
+          break;
+        }
+        streamContent = `${lw} w\n${r} ${g} ${b} RG\n`;
+        // Zie de rechthoek hierboven: 'none'/'transparent' gaven zwart (#433).
+        const ellipsVulling = hasFill(ann.fillColor);
+        if (ellipsVulling) {
+          const [fr, fg, fb] = hexToRgb(ann.fillColor);
+          streamContent += `${fr} ${fg} ${fb} rg\n`;
+        }
+        if (ellipsArcering) {
+          // Met arcering (#621): vulling, arcering, rand.
+          if (ellipsVulling) streamContent += `${ellips}f\n`;
+          streamContent += `${ellipsArcering}${ellipsStreep}${ellips}S\n`;
+        } else {
+          streamContent += ellipsStreep + ellips;
+          streamContent += ellipsVulling ? 'B\n' : 'S\n';
+        }
+        streamContent += kruis;
+        break;
+      }
+      case 'line': {
+        // Lines and arrows get their appearance in saver.js (buildLineAP).
+        return null;
+      }
+      case 'draw': {
+        if (!ann.path || ann.path.length < 2) return null;
+        const xs = ann.path.map(p => p.x);
+        const ys = ann.path.map(p => p.y);
+        const minX = Math.min(...xs) - 2;
+        const minY = Math.min(...ys) - 2;
+        const maxX = Math.max(...xs) + 2;
+        const maxY = Math.max(...ys) + 2;
+        bbox = [0, 0, maxX - minX, maxY - minY];
+        const [r, g, b] = hexToRgb(ann.strokeColor || ann.color || '#000000');
+        const lw = ann.lineWidth ?? 2;
+        // Round caps and joins plus the dash pattern, as the screen draws the
+        // stroke (rendering.js) and the pressure-ink appearance writes it
+        // (pressure-ink.js inktAppearanceInhoud). Without the dash operator a
+        // dashed or dotted stroke was solid in other readers.
+        streamContent = `${lw} w\n1 J\n1 j\n${r} ${g} ${b} RG\n${streepOperator(ann.borderStyle)}`;
+        streamContent += `${ann.path[0].x - minX} ${maxY - ann.path[0].y} m\n`;
+        for (let i = 1; i < ann.path.length; i++) {
+          streamContent += `${ann.path[i].x - minX} ${maxY - ann.path[i].y} l\n`;
+        }
+        streamContent += 'S\n';
+        break;
+      }
+      case 'text':
+      case 'textbox':
+      case 'callout': {
+        // Skip AP stream for FreeText - let PDF viewers render from Contents + DA
+        // natively, which properly displays text. AP stream only draws shapes,
+        // causing text to disappear in viewers that use AP over DA.
+        return null;
+      }
+      default:
+        return null;
+    }
+
+    if (!streamContent || !bbox) return null;
+
+    const streamDict = {
+      Type: 'XObject',
+      Subtype: 'Form',
+      BBox: bbox
+    };
+
+    // Add rotation Matrix for rotated annotations (negate: canvas Y-down → PDF Y-up)
+    if (ann.rotation && (ann.type === 'box' || ann.type === 'circle')) {
+      const rad = -ann.rotation * Math.PI / 180;
+      const cos = Math.cos(rad);
+      const sin = Math.sin(rad);
+      streamDict.Matrix = [
+        parseFloat(cos.toFixed(6)),
+        parseFloat(sin.toFixed(6)),
+        parseFloat((-sin).toFixed(6)),
+        parseFloat(cos.toFixed(6)),
+        0, 0
+      ];
+    }
+
+    return context.stream(streamContent, streamDict);
+  } catch (e) {
+    console.warn('Failed to generate appearance stream for', ann.type, e);
+    return null;
+  }
+}

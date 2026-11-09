@@ -1,0 +1,73 @@
+/* ==============================
+   Language-specific UI font fallbacks
+   ==============================
+   The interface font is defined once in base.css as --ui-font and starts
+   with system-ui, so every language gets the operating system's interface
+   font first. Latin, Cyrillic and Greek need nothing extra: system-ui and
+   the generic fallbacks cover them.
+
+   Scripts below add fonts that are known to carry the script well, after
+   system-ui and before the generic fallback, for systems whose interface
+   font lacks those glyphs. The order per list is Windows, macOS, Linux.
+   Only --ui-font is overridden here, on the root, and :lang() also
+   matches regional codes such as zh-CN; elements keep using var(--ui-font).
+*/
+
+/* --- Arabic script (RTL) --- */
+
+/* Arabic, Farsi (Persian) */
+:root:lang(ar),
+:root:lang(fa) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Geeza Pro', 'SF Arabic', 'Noto Sans Arabic', Tahoma, Arial, sans-serif;
+}
+
+/* Urdu */
+:root:lang(ur) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Geeza Pro', 'SF Arabic', 'Noto Nastaliq Urdu', 'Noto Sans Arabic', Tahoma, sans-serif;
+}
+
+/* Hebrew */
+:root:lang(he) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Arial Hebrew', 'SF Hebrew', 'Noto Sans Hebrew', Tahoma, Arial, sans-serif;
+}
+
+/* --- CJK (East Asian) --- */
+
+/* Chinese (Simplified) */
+:root:lang(zh) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans SC', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif;
+}
+
+/* Japanese */
+:root:lang(ja) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Yu Gothic UI', 'Meiryo UI', Meiryo, 'Hiragino Sans', 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', 'Noto Sans CJK JP', sans-serif;
+}
+
+/* Korean */
+:root:lang(ko) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', 'Noto Sans CJK KR', sans-serif;
+}
+
+/* --- South Asian --- */
+
+/* Hindi */
+:root:lang(hi) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Nirmala UI', 'Kohinoor Devanagari', 'Devanagari MT', 'Noto Sans Devanagari', Mangal, sans-serif;
+}
+
+/* Bengali */
+:root:lang(bn) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Nirmala UI', 'Kohinoor Bangla', 'Bangla MN', 'Noto Sans Bengali', Vrinda, sans-serif;
+}
+
+/* Tamil */
+:root:lang(ta) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Nirmala UI', 'Kohinoor Tamil', 'Tamil MN', 'Noto Sans Tamil', Latha, sans-serif;
+}
+
+/* --- Southeast Asian --- */
+
+/* Thai */
+:root:lang(th) {
+  --ui-font: system-ui, -apple-system, BlinkMacSystemFont, 'Leelawadee UI', Thonburi, 'Noto Sans Thai', Tahoma, sans-serif;
+}

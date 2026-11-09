@@ -1,0 +1,265 @@
+import { createSignal } from 'solid-js';
+import RibbonGroup from './RibbonGroup.jsx';
+import AdaptiveGroups from './AdaptiveGroups.jsx';
+import RibbonButton from './RibbonButton.jsx';
+import RibbonButtonStack from './RibbonButtonStack.jsx';
+import SplitButton from './SplitButton.jsx';
+import { highlightMode, highlightActive, kiesMarkering, markeringKnop } from '../../../tools/highlight-mode.js';
+import { colorPickerValue, lineWidthValue } from '../../stores/ribbonStore.js';
+import { strokeColor, fmtLineWidth, isLocked, opmaakDoel, opmaakOndersteunt, zetOpmaak } from '../../stores/formatStore.js';
+import { zetRanddikte } from '../../../annotations/rendering/textbox-layout.js';
+import { setTool } from '../../../tools/manager.js';
+import { state, getActiveDocument, noPdf } from '../../../core/state.js';
+import { isPdfAReadOnly } from '../../../pdf/loader.js';
+import { recordClearPage, recordClearAll, recordAdd } from '../../../core/undo-manager.js';
+import { hideProperties } from '../../../ui/panels/properties-panel.js';
+import { clearSelection } from '../../../core/stores/selection-helpers.js';
+import { redrawAnnotations, redrawContinuous } from '../../../annotations/rendering.js';
+import { showCalibrationDialog } from '../../../annotations/measurement.js';
+import {
+  highlightIcon, textHighlightIcon, freehandIcon, lineIcon, arrowIcon, polylineIcon,
+  rectIcon, ellipseIcon, polygonIcon, cloudIcon, cloudPolylineIcon,
+  textAnnotIcon, textboxIcon, noteIcon, fileAttachmentIcon, calloutIcon,
+  stampIcon, signatureIcon, digitalSignIcon,
+  redactionIcon, applyRedactionsIcon,
+  clearPageIcon, clearAllIcon, flattenAllIcon, unflattenAllIcon,
+  measureDistanceIcon, measureAreaIcon, measurePerimeterIcon, measureAngleIcon, calibrateIcon
+} from '../../data/ribbonIcons.js';
+
+import { useTranslation } from '../../../i18n/useTranslation.js';
+import { setPickerOpen as setParametricPickerOpen } from '../../stores/parametricSymbolStore.js';
+import { savePreferences } from '../../../core/preferences.js';
+import { toggleSchedule, scheduleVisible } from '../../stores/scheduleStore.js';
+import { isDynamicScalingEnabled, setDynamicScalingEnabled } from '../../../annotations/dynamic-scaling.js';
+import PrefSelect from '../preferences/PrefSelect.jsx';
+import { toggleProofreading, PROOFREAD_TOOL } from '../../../tools/proofreading-mode.js';
+
+// Proofreading (#508): lines of text, a struck word (red) and an insert caret (blue).
+const proofreadIcon = `<svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><line x1="3" y1="5" x2="21" y2="5" stroke-width="1.5"/><line x1="3" y1="11" x2="8" y2="11" stroke-width="1.5"/><line x1="10" y1="11" x2="21" y2="11" stroke-width="1.5"/><line x1="10" y1="11" x2="16" y2="11" stroke="#FF0000" stroke-width="2"/><line x1="3" y1="17" x2="21" y2="17" stroke-width="1.5"/><path d="M6 21.5 L8.5 17.5 L11 21.5" stroke="#0066FF" stroke-width="1.8" stroke-linejoin="round"/></svg>`;
+
+const scheduleIcon = `<svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="1.5" stroke-width="1.5"/><line x1="3" y1="8" x2="21" y2="8" stroke-width="1.5"/><line x1="3" y1="13" x2="21" y2="13" stroke-width="1"/><line x1="3" y1="18" x2="21" y2="18" stroke-width="1"/><line x1="9" y1="8" x2="9" y2="21" stroke-width="1"/><line x1="15" y1="8" x2="15" y2="21" stroke-width="1"/></svg>`;
+
+// The comment groups are exported as a standalone fragment so the merged
+// "Tekenen & annotatie" tab (AnnotateTab) can compose them alongside the
+// drawing groups inside a single AdaptiveGroups container.
+export function CommentGroups() {
+  const { t } = useTranslation('ribbon');
+
+  // Kleur en breedte (#668) werken op hetzelfde doel als de opmaakwerkbalk:
+  // de selectie, anders het volgende object van het actieve gereedschap (of
+  // de invoegsessie van symbolen). Zonder doel staan ze uit.
+  const kan = (key) => !noPdf() && !isPdfAReadOnly() && !isLocked() && opmaakOndersteunt(key);
+
+  return (
+    <>
+        {/* Drawing tools (line/arrow/polyline/arc/spline/rect/ellipse/polygon/cloud/cloudPolyline/filledArea/freehand)
+            were moved to the dedicated Drawing tab. Comment tab keeps only
+            comment-style annotations (highlight, callout, note, stamp, etc.). */}
+        <RibbonGroup label={t('comment.drawing')}>
+          {/* Markeren (#927): gebied (vak trekken) of tekst (over tekst
+              slepen). De hoofdknop gebruikt de laatst gekozen modus en
+              wisselt als hij al aan staat; het menu kiest een modus. */}
+          <SplitButton
+            id="tool-highlight-split"
+            dropdownTitle={t('comment.highlightMode')}
+            disabled={noPdf() || isPdfAReadOnly()}
+            main={
+              <RibbonButton id="tool-highlight"
+                title={highlightMode() === 'text'
+                  ? `${t('comment.textHighlight')}: ${t('comment.textHighlightTitle')}`
+                  : t('comment.areaHighlightTitle')}
+                icon={highlightMode() === 'text' ? textHighlightIcon : highlightIcon} label={t('comment.highlight')}
+                disabled={noPdf() || isPdfAReadOnly()} active={highlightActive()} onClick={markeringKnop} />
+            }
+          >
+            <button class="ribbon-split-btn-menu-item" id="highlight-menu-area"
+              title={t('comment.areaHighlightTitle')}
+              classList={{ active: highlightMode() === 'area' }}
+              onClick={() => kiesMarkering('area')}>
+              <span class="ribbon-split-btn-menu-icon" innerHTML={highlightIcon}></span>
+              {t('comment.areaHighlight')}
+            </button>
+            <button class="ribbon-split-btn-menu-item" id="highlight-menu-text"
+              title={t('comment.textHighlightTitle')}
+              classList={{ active: highlightMode() === 'text' }}
+              onClick={() => kiesMarkering('text')}>
+              <span class="ribbon-split-btn-menu-icon" innerHTML={textHighlightIcon}></span>
+              {t('comment.textHighlight')}
+            </button>
+          </SplitButton>
+        </RibbonGroup>
+
+        <RibbonGroup label={t('comment.text')}>
+          <RibbonButton id="tool-textbox" title={t('comment.textBox')} icon={textboxIcon} label={t('comment.textBox')}
+            disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'textbox'} onClick={() => setTool('textbox')} />
+          <RibbonButton id="tool-callout" title={t('comment.callout')} icon={calloutIcon} label={t('comment.callout')}
+            disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'callout'} onClick={() => setTool('callout')} />
+          <RibbonButton id="tool-comment" title={t('comment.note')} icon={noteIcon} label={t('comment.note')}
+            disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'comment'} onClick={() => setTool('comment')} />
+          <RibbonButton id="tool-file-attachment" title={t('comment.fileAttachmentTitle')} icon={fileAttachmentIcon} label={t('comment.fileAttachment')}
+            disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'fileAttachment'} onClick={() => setTool('fileAttachment')} />
+        </RibbonGroup>
+
+        <RibbonGroup label={t('proofread.group')}>
+          <RibbonButton id="tool-proofread" title={t('proofread.tooltip')} icon={proofreadIcon} label={t('proofread.button')}
+            disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === PROOFREAD_TOOL} onClick={() => toggleProofreading()} />
+        </RibbonGroup>
+
+        <RibbonGroup label={t('comment.stamp')}>
+          <RibbonButton id="tool-stamp" title={t('comment.stamp')} icon={stampIcon} label={t('comment.stamp')}
+            disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'stamp'} onClick={() => setTool('stamp')} />
+          <RibbonButton id="tool-signature" title={t('comment.signature')} icon={signatureIcon} label={t('comment.signature')}
+            disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'signature'} onClick={() => setTool('signature')} />
+          {/* Cryptografisch ondertekenen met een certificaat (#374). Ook bij een
+              PDF/A: de handtekening komt in een incrementele toevoeging. */}
+          <RibbonButton id="btn-digital-sign" title={t('comment.digitalSignTooltip')} icon={digitalSignIcon} label={t('comment.digitalSign')}
+            disabled={noPdf()}
+            onClick={async () => {
+              const { startDigitaalOndertekenen } = await import('../../../pdf/handtekeningen/ondertekenen.js');
+              await startDigitaalOndertekenen();
+            }} />
+          <RibbonButton id="tool-parametric-symbol" title={t('comment.parametricSymbol')}
+            icon={stampIcon} label={t('comment.parametricSymbol')}
+            disabled={noPdf() || isPdfAReadOnly()}
+            active={state.currentTool === 'parametricSymbol'}
+            onClick={() => setParametricPickerOpen(true)} />
+        </RibbonGroup>
+
+        <RibbonGroup label={t('comment.redaction')}>
+          <RibbonButton id="tool-redaction" title={t('comment.markForRedaction')} icon={redactionIcon} label={t('comment.redact')}
+            disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'redaction'} onClick={() => setTool('redaction')} />
+          <RibbonButton id="btn-apply-redactions" title={t('comment.applyRedactions')} icon={applyRedactionsIcon} label={t('comment.applyLabel')}
+            disabled={noPdf() || isPdfAReadOnly()} iconStyle={{ color: '#dc2626' }}
+            onClick={async () => {
+              const { applyRedactions } = await import('../../../annotations/redaction.js');
+              await applyRedactions();
+            }} />
+        </RibbonGroup>
+
+        <RibbonGroup label={t('comment.properties')}>
+          <RibbonButtonStack>
+            <div class="ribbon-input-row">
+              <label class="ribbon-input-label">{t('comment.color')}</label>
+              <input type="color" id="color-picker" class="ribbon-color-input"
+                title={t('comment.propertiesHint')}
+                value={opmaakDoel() ? strokeColor() : colorPickerValue()}
+                disabled={!kan('strokeColor')}
+                onChange={(e) => {
+                  const kleur = e.currentTarget.value;
+                  zetOpmaak({ strokeColor: kleur }, ann => {
+                    ann.strokeColor = kleur;
+                    ann.color = kleur;
+                    // Een markering kleurt met haar vulling, zoals het
+                    // markeergereedschap haar maakt.
+                    if (ann.type === 'highlight') ann.fillColor = kleur;
+                  });
+                }} />
+            </div>
+            <div class="ribbon-input-row">
+              <label class="ribbon-input-label">{t('comment.width')}</label>
+              <input type="text" inputmode="decimal" data-getal id="line-width" class="ribbon-input" min="0.1" max="50"
+                title={t('comment.propertiesHint')}
+                value={opmaakDoel() ? fmtLineWidth() : lineWidthValue()}
+                disabled={!kan('lineWidth')}
+                onInput={(e) => {
+                  const dikte = parseFloat(e.currentTarget.value);
+                  if (!Number.isFinite(dikte) || dikte <= 0) return;
+                  zetOpmaak({ lineWidth: dikte }, ann => { zetRanddikte(ann, dikte); });
+                }} />
+            </div>
+          </RibbonButtonStack>
+        </RibbonGroup>
+
+        <RibbonGroup label={t('comment.edit')}>
+          <RibbonButtonStack>
+            <RibbonButton size="small" id="tool-clear" title={t('comment.clearPageAnnotations')} icon={clearPageIcon} label={t('comment.clearPage')}
+              disabled={noPdf() || isPdfAReadOnly()} onClick={async () => {
+                let confirmed = false;
+                if (window.__TAURI__?.dialog?.ask) {
+                  confirmed = await window.__TAURI__.dialog.ask(t('comment.clearPageConfirm'), { title: t('comment.clearPage'), kind: 'warning' });
+                } else {
+                  confirmed = confirm(t('comment.clearPageConfirm'));
+                }
+                if (confirmed) {
+                  const cpDoc = getActiveDocument();
+                  const cpPage = cpDoc ? cpDoc.currentPage : 1;
+                  recordClearPage(cpPage, cpDoc?.annotations || []);
+                  if (cpDoc) cpDoc.annotations = cpDoc.annotations.filter(a => a.page !== cpPage);
+                  clearSelection();
+                  hideProperties();
+                  if (getActiveDocument()?.viewMode === 'continuous') { redrawContinuous(); } else { redrawAnnotations(); }
+                }
+              }} />
+            <RibbonButton size="small" id="ribbon-clear-all" title={t('comment.clearAllAnnotations')} icon={clearAllIcon} label={t('comment.clearAll')}
+              disabled={noPdf() || isPdfAReadOnly()} onClick={async () => {
+                const caDoc = getActiveDocument();
+                if (!caDoc || caDoc.annotations.length === 0) return;
+                const confirmed = await window.__TAURI__?.dialog?.ask(t('comment.clearAllConfirm'), { title: t('comment.clearAll'), kind: 'warning' });
+                if (confirmed) {
+                  recordClearAll(caDoc.annotations);
+                  caDoc.annotations = [];
+                  clearSelection();
+                  hideProperties();
+                  if (getActiveDocument()?.viewMode === 'continuous') { redrawContinuous(); } else { redrawAnnotations(); }
+                }
+              }} />
+          </RibbonButtonStack>
+          {/* Alles vlakken / terughalen (#615): in het geopende document, ongedaan te maken. */}
+          <RibbonButtonStack>
+            <RibbonButton size="small" id="ribbon-flatten-all" title={t('comment.flattenAllTooltip')} icon={flattenAllIcon} label={t('comment.flattenAll')}
+              disabled={noPdf() || isPdfAReadOnly()} onClick={() => {
+                import('../../../pdf/flatten-all.js').then((m) => m.flattenAllMarkups());
+              }} />
+            <RibbonButton size="small" id="ribbon-unflatten-all" title={t('comment.unflattenAllTooltip')} icon={unflattenAllIcon} label={t('comment.unflattenAll')}
+              disabled={noPdf() || isPdfAReadOnly()} onClick={() => {
+                import('../../../pdf/flatten-all.js').then((m) => m.unflattenAllMarkups());
+              }} />
+          </RibbonButtonStack>
+        </RibbonGroup>
+
+        <RibbonGroup label={t('measure.tools') || 'METEN'}>
+          <RibbonButtonStack>
+            <RibbonButton size="small" id="tool-measure-distance" title={t('measure.measureDistance') || 'Afstand meten'} icon={measureDistanceIcon} label={t('measure.distance') || 'Afstand'}
+              disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'measureDistance'} onClick={() => setTool('measureDistance')} />
+            <RibbonButton size="small" id="tool-measure-area" title={t('measure.measureArea') || 'Oppervlakte meten'} icon={measureAreaIcon} label={t('measure.area') || 'Oppervlakte'}
+              disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'measureArea'} onClick={() => setTool('measureArea')} />
+          </RibbonButtonStack>
+          <RibbonButtonStack>
+            <RibbonButton size="small" id="tool-measure-perimeter" title={t('measure.measurePerimeter') || 'Omtrek meten'} icon={measurePerimeterIcon} label={t('measure.perimeter') || 'Omtrek'}
+              disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'measurePerimeter'} onClick={() => setTool('measurePerimeter')} />
+            <RibbonButton size="small" id="tool-measure-angle" title={t('measure.measureAngle') || 'Hoek meten'} icon={measureAngleIcon} label={t('measure.angle') || 'Hoek'}
+              disabled={noPdf() || isPdfAReadOnly()} active={state.currentTool === 'measureAngle'} onClick={() => setTool('measureAngle')} />
+          </RibbonButtonStack>
+          {/* Schaal instellen bij de meetgereedschappen (#972): referentielijn
+              of standaardschaal, metrisch en imperiaal. */}
+          <RibbonButtonStack>
+            <RibbonButton size="small" id="tool-measure-calibrate" title={t('comment.calibrateTitle') || 'Scale Calibration'} icon={calibrateIcon} label={t('comment.calibrate') || 'Calibrate'}
+              disabled={noPdf() || isPdfAReadOnly()} onClick={() => showCalibrationDialog()} />
+          </RibbonButtonStack>
+        </RibbonGroup>
+
+        {/* Schaal group (Schaalgebied / Schaalgebied op pagina) moved to the
+            Tekenen tab — see DrawingTab.jsx. */}
+
+        <RibbonGroup label={t('measure.schedule') || 'HOEVEELHEDEN'}>
+          <RibbonButton id="btn-open-schedule"
+            title={t('measure.openSchedule') || 'Hoeveelheden'}
+            icon={scheduleIcon}
+            label={t('measure.takeOff') || 'Hoeveelheden'}
+            disabled={noPdf()}
+            active={scheduleVisible()}
+            onClick={toggleSchedule} />
+        </RibbonGroup>
+    </>
+  );
+}
+
+export default function CommentTab() {
+  return (
+    <div class="ribbon-content active" id="tab-comment">
+      <AdaptiveGroups>
+        <CommentGroups />
+      </AdaptiveGroups>
+    </div>
+  );
+}
