@@ -15,7 +15,7 @@ The files below were changed by SipilStock. Everything else is upstream's, uncha
 - Managed mode is always on in the desktop app (`open-pdf-studio/src-tauri/src/beheerd.rs`): no check of
   upstream's releases and no update window or first-run prompts; updates come through SipilStock Apps.
 - Icons replaced by the SipilPDF icon set (PNG, ICO, ICNS, SVG).
-- `README.md` replaced (upstream's is `README.upstream.md`); this file added.
+- `README.md` replaced (upstream's is `README.upstream.md`); this file, `BUILD.md`, `SIPIL_VERSION` and the Windows installer script `packaging/windows/sipilpdf.iss` added.
 - Not committed here: upstream's CI definitions, committed build output, test PDFs, promo material.
 
 Changed files by the text substitution: 335 (listed in the build log).
